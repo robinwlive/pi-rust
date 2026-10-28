@@ -326,6 +326,7 @@ impl HostApi {
             // offset (a plugin built against the previous layout keeps working).
             register_before_agent_start: Some(trampoline_register_before_agent_start),
             register_oauth_provider: Some(trampoline_register_oauth_provider),
+            register_oauth_provider_cancellable: None,
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
