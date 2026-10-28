@@ -603,6 +603,7 @@ pub fn load_session_mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OAuthExtensionError;
     use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -952,6 +953,158 @@ pub extern "C" fn rpi_plugin_register(_: *const std::ffi::c_void) -> i32 {
             None,
         );
         assert!(empty.is_empty());
+    }
+
+    /// Prelude shared by the OAuth ABI fixtures. A foreign plugin sees the host
+    /// types only through their layout, so they are spelled out here by hand.
+    const OAUTH_FIXTURE_PRELUDE: &str = r#"
+use std::ffi::c_void;
+#[repr(C)] #[derive(Clone, Copy)] struct Str { ptr: *const c_void, len: usize }
+#[repr(C)] #[derive(Clone, Copy)] struct Owned { ptr: *mut c_void, len: usize }
+extern "C" fn free_output(_: Owned) {}
+const MANIFEST: &[u8] = b"{\"id\":\"acme\"}";
+fn mark(path: &str, bytes: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    file.write_all(bytes).unwrap();
+}
+"#;
+
+    /// An older plugin registers through the legacy `register_oauth_provider`
+    /// slot. The current host must still dispatch to it, with no control.
+    #[test]
+    fn legacy_oauth_slot_from_an_older_plugin_reaches_the_host() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-legacy-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let offset = std::mem::offset_of!(rpi_plugin_sdk::PluginApi, register_oauth_provider);
+        let fixture = build_cdylib_fixture(
+            "oauth_legacy_slot",
+            &format!(
+                r#"{OAUTH_FIXTURE_PRELUDE}
+extern "C" fn legacy(_req: Str, _out: *mut Owned, _data: *mut c_void) -> i32 {{
+    mark({marker:?}, b"L");
+    9
+}}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(Str, extern "C" fn(Str, *mut Owned, *mut c_void) -> i32,
+        extern "C" fn(Owned), *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    let manifest = Str {{ ptr: MANIFEST.as_ptr().cast(), len: MANIFEST.len() }};
+    register.unwrap()(manifest, legacy, free_output, std::ptr::null_mut())
+}}
+"#
+            ),
+        );
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session.snapshot_arc().expect("legacy fixture registers");
+        let provider = snapshot.oauth_provider("acme").expect("legacy provider");
+        assert!(provider.control_fn.is_none());
+        let result = crate::request_oauth(&snapshot, "acme", "begin", serde_json::json!({}));
+        assert!(
+            matches!(result, Err(OAuthExtensionError::PluginStatus(9, _))),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"L");
+        let _ = fs::remove_file(marker);
+    }
+
+    /// A current plugin registers through `register_oauth_provider_cancellable`.
+    /// Its `exchange` blocks until the host cancels a request that is in flight,
+    /// across the real cdylib boundary.
+    #[test]
+    fn cancellable_oauth_slot_delivers_host_cancellation_across_the_abi() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-cancel-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let offset = std::mem::offset_of!(
+            rpi_plugin_sdk::PluginApi,
+            register_oauth_provider_cancellable
+        );
+        let fixture = build_cdylib_fixture(
+            "oauth_cancellable_slot",
+            &format!(
+                r#"{OAUTH_FIXTURE_PRELUDE}
+#[repr(C)]
+struct Control {{
+    struct_size: u32,
+    is_cancelled: extern "C" fn(*mut c_void) -> i32,
+    user_data: *mut c_void,
+}}
+extern "C" fn controlled(_req: Str, control: *const Control, _out: *mut Owned, _data: *mut c_void) -> i32 {{
+    let control = unsafe {{ &*control }};
+    if (control.struct_size as usize) < std::mem::size_of::<Control>() {{
+        mark({marker:?}, b"S");
+        return 2;
+    }}
+    mark({marker:?}, b"C");
+    let started = std::time::Instant::now();
+    while (control.is_cancelled)(control.user_data) == 0 {{
+        if started.elapsed() > std::time::Duration::from_secs(10) {{
+            mark({marker:?}, b"T");
+            return 3;
+        }}
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }}
+    mark({marker:?}, b"K");
+    9
+}}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(Str, extern "C" fn(Str, *const Control, *mut Owned, *mut c_void) -> i32,
+        extern "C" fn(Owned), *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    let manifest = Str {{ ptr: MANIFEST.as_ptr().cast(), len: MANIFEST.len() }};
+    register.unwrap()(manifest, controlled, free_output, std::ptr::null_mut())
+}}
+"#
+            ),
+        );
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session
+            .snapshot_arc()
+            .expect("cancellable fixture registers");
+        assert!(snapshot
+            .oauth_provider("acme")
+            .expect("cancellable provider")
+            .control_fn
+            .is_some());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = crate::request_oauth_with_cancel(
+            &snapshot,
+            "acme",
+            "exchange",
+            serde_json::json!({"value": "code"}),
+            &cancel,
+        );
+        let elapsed = started.elapsed();
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
+        // "C": the plugin saw a sized control. "K": it observed the cancellation.
+        assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        let _ = fs::remove_file(marker);
     }
 
     #[test]
