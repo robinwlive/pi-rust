@@ -467,6 +467,7 @@ fn test_tui_state() -> Arc<TuiState> {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1813,6 +1814,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2299,6 +2301,86 @@ fn provider_login_saves_deepseek_key_and_restores_editor() {
             .contains_key("cancelled-provider"));
         assert!(rx.try_recv().is_err());
     });
+}
+
+/// Esc ends an OAuth flow through `finish_provider_login`, which cancels the
+/// call the flow started. The begin call and the exchange each carry the flow's
+/// token, so Esc reaches whichever call is running.
+#[test]
+fn provider_oauth_escape_cancels_the_in_flight_call() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    // Esc while `begin` is running.
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        cancel: begin_cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("begin was not sent");
+    };
+    assert_eq!(action, "begin");
+    assert!(!begin_cancel.is_cancelled());
+    finish_provider_login(&state, &editor_container, &editor, &tui);
+    assert!(begin_cancel.is_cancelled());
+
+    // Esc while `exchange` is running: submit from the input stage, then Esc.
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction {
+        cancel: second_begin_cancel,
+        flow_id,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("second begin was not sent");
+    };
+    assert!(
+        !second_begin_cancel.is_cancelled(),
+        "a new flow must not inherit the cancelled token"
+    );
+    let payload = serde_json::json!({
+        "display": {"title": "Authorize", "url": "https://example.test/auth"}
+    });
+    begin_provider_oauth_input(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        payload,
+        flow_id,
+    );
+    let input = state.active_provider_input.lock().unwrap().clone().unwrap();
+    input.handle_paste("code-value");
+    assert!(handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        cancel: exchange_cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("exchange was not sent");
+    };
+    assert_eq!(action, "exchange");
+    assert!(!exchange_cancel.is_cancelled());
+    finish_provider_login(&state, &editor_container, &editor, &tui);
+    assert!(exchange_cancel.is_cancelled());
+    // After the flow ends, a stray submit gets an already-cancelled token.
+    assert!(state.provider_auth_token().is_cancelled());
 }
 
 #[test]
@@ -2886,6 +2968,7 @@ fn test_autocomplete_slash_suggestions_render() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2983,6 +3066,7 @@ fn test_select_list_swap_restores_editor() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3083,6 +3167,7 @@ fn test_message_history_browse_restores_draft() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3186,6 +3271,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -3275,6 +3361,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),

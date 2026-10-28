@@ -243,6 +243,10 @@ pub(super) struct TuiState {
     /// Monotonic source for OAuth flow ids. Kept separate so an inactive flow
     /// can use zero without allowing a late result to match a future flow.
     pub(super) provider_auth_generation: std::sync::atomic::AtomicU64,
+    /// Cancellation for the provider OAuth call in flight. Created when a flow
+    /// begins and cancelled when it ends (Esc, a finished result, or a new flow),
+    /// so a plugin's blocking begin, exchange or revoke can stop early.
+    pub(super) provider_auth_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// The select-list currently occupying the input slot for a choice-style
     /// provider form step (the protocol step). Mutually exclusive with
     /// [`Self::active_provider_input`].
@@ -1462,6 +1466,42 @@ impl TuiState {
             previous.cancel();
         }
         cancellation
+    }
+
+    /// Start the cancellation scope for a new provider OAuth flow. A previous
+    /// token is cancelled, so a call from an older flow cannot outlive it.
+    pub(super) fn begin_provider_auth(&self) -> CancellationToken {
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = self
+            .provider_auth_cancel
+            .lock()
+            .unwrap()
+            .replace(cancellation.clone())
+        {
+            previous.cancel();
+        }
+        cancellation
+    }
+
+    /// The token for the active flow's next provider call. With no active flow
+    /// it is already cancelled, so a late submit cannot run unobserved.
+    pub(super) fn provider_auth_token(&self) -> CancellationToken {
+        match self.provider_auth_cancel.lock().unwrap().as_ref() {
+            Some(cancellation) => cancellation.clone(),
+            None => {
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                cancellation
+            }
+        }
+    }
+
+    /// End the active provider OAuth flow and cancel its call, if one is running.
+    pub(super) fn cancel_provider_auth(&self) {
+        let cancellation = self.provider_auth_cancel.lock().unwrap().take();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
     }
 
     /// Clear the user-bash slot. Called when the command finishes so the

@@ -885,7 +885,7 @@ fn begin_api_key_login(
     tui.request_render(false);
 }
 
-fn begin_provider_oauth_login(
+pub(super) fn begin_provider_oauth_login(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
@@ -900,6 +900,7 @@ fn begin_provider_oauth_login(
     state
         .provider_auth_flow_id
         .store(flow_id, std::sync::atomic::Ordering::Release);
+    let cancel = state.begin_provider_auth();
     show_provider_auth_status(
         state,
         editor_container,
@@ -913,6 +914,7 @@ fn begin_provider_oauth_login(
         input: serde_json::json!({}),
         purpose: ProviderOAuthPurpose::Login,
         flow_id,
+        cancel,
     });
 }
 pub(super) fn show_provider_auth_status(
@@ -1065,7 +1067,7 @@ pub(super) fn handle_provider_oauth_result(
     }
 }
 
-fn begin_provider_oauth_input(
+pub(super) fn begin_provider_oauth_input(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
@@ -1146,6 +1148,7 @@ fn begin_provider_oauth_input(
             input: serde_json::json!({"value": value}),
             purpose: ProviderOAuthPurpose::Login,
             flow_id,
+            cancel: state_submit.provider_auth_token(),
         });
     }));
 
@@ -1168,6 +1171,7 @@ pub(super) fn finish_provider_login(
     state
         .provider_auth_flow_id
         .store(0, std::sync::atomic::Ordering::Release);
+    state.cancel_provider_auth();
     *state.active_provider_input.lock().unwrap() = None;
     editor_container.clear();
     editor_container.add_child(editor.clone());
