@@ -397,10 +397,31 @@ fn send_message_input(args: &serde_json::Value) -> Result<rpi_agent::AgentMessag
             timestamp,
         ));
     }
-    let text =
-        arg_str(args, "text").map_err(|_| "missing `message` or `text` field".to_string())?;
+    // Text and images are independent here too: a pure-image send (a pasted
+    // screenshot with no caption) is valid as long as one image survives
+    // parsing. `send_user_message` already worked this way; `SendMessage` is the
+    // other entry point into the same harness path, so it had the same gap.
+    let text = arg_str_opt(args, "text").unwrap_or_default();
+    let parsed = parse_images(args)?;
+    if text.is_empty() && parsed.images.is_empty() {
+        return Err("missing `message` or `text` field".to_string());
+    }
+    let content = if parsed.images.is_empty() {
+        rpi_ai::types::UserContent::Text(text)
+    } else {
+        let mut blocks: Vec<rpi_ai::types::Content> = Vec::new();
+        if !text.is_empty() {
+            blocks.push(rpi_ai::types::Content::Text(rpi_ai::types::TextContent {
+                kind: Default::default(),
+                text,
+                text_signature: None,
+            }));
+        }
+        blocks.extend(parsed.images.into_iter().map(rpi_ai::types::Content::Image));
+        rpi_ai::types::UserContent::Blocks(blocks)
+    };
     Ok(rpi_agent::AgentMessage::User(
-        rpi_ai::types::UserMessage::new(text, timestamp),
+        rpi_ai::types::UserMessage::new(content, timestamp),
     ))
 }
 
@@ -523,7 +544,16 @@ impl RuntimeActionHost for HarnessActionHost {
             .send_message(message, options)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(send_message_result(result))
+        let mut out = send_message_result(result);
+        // Report what actually went out, so a caller can tell "no images were
+        // skipped" apart from "this host does not report it" — same contract as
+        // `send_user_message`.
+        if let Some(object) = out.as_object_mut() {
+            let parsed = parse_images(&args)?;
+            object.insert("images".into(), serde_json::json!(parsed.images.len()));
+            object.insert("skippedImages".into(), serde_json::json!(parsed.skipped));
+        }
+        Ok(out)
     }
 
     async fn send_user_message(

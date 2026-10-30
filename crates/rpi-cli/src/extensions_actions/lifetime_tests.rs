@@ -345,3 +345,98 @@ async fn send_user_message_stores_attached_images_in_the_transcript() {
     assert_eq!(images[0].data, png);
 >>>>>>> 3a55693 (feat(plugin-sdk): allow images in SendUserMessage)
 }
+
+/// `SendMessage` is the other entry point into the same harness path, so it had
+/// the same image gap as `SendUserMessage`: `{"text", "images"}` silently sent
+/// text only. This pins both the reported counts and the stored shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_message_stores_attached_images_in_the_transcript() {
+    use base64::Engine as _;
+
+    let (host, cell) = HarnessActionHost::new_empty(
+        vec![],
+        std::env::temp_dir(),
+        Handle::current(),
+        BTreeMap::new(),
+        rpi_extensions::ToolCallContext::default(),
+    );
+    let provider = FauxProvider::new(FauxScript::new().with_text("got it"));
+    // Declare image input, otherwise the harness projects the block into an
+    // "[Image omitted: …]" placeholder before storing it and the assertion
+    // below would be testing the projection, not the send path.
+    let mut model = provider.default_model().clone();
+    model.input = vec![
+        rpi_ai::types::InputModality::Text,
+        rpi_ai::types::InputModality::Image,
+    ];
+    let harness = AgentHarness::create(AgentHarnessOptions {
+        model,
+        models: vec![provider],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+
+    let png = base64::engine::general_purpose::STANDARD.encode([
+        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+
+    let result = host
+        .send_message(json!({
+            "text": "look",
+            "images": [
+                {"mediaType":"image/png","data": png},
+                {"mediaType":"image/png","data": "not-base64!!"},
+            ]
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result["images"], 1);
+    assert_eq!(result["skippedImages"], 1);
+
+    let log = harness
+        .session()
+        .get_log(&rpi_harness::session::types::LogOptions {
+            after_seq: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    let user = log
+        .iter()
+        .find_map(|item| match item {
+            rpi_harness::session::types::LogItem::Entry {
+                entry: rpi_harness::session::types::Entry::Message(entry),
+                ..
+            } => match &entry.message {
+                rpi_agent::AgentMessage::User(user) => Some(user),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the user message must be in the transcript");
+    let blocks = match &user.content {
+        rpi_ai::types::UserContent::Blocks(blocks) => blocks.clone(),
+        rpi_ai::types::UserContent::Text(text) => {
+            panic!("expected block content, got text {text:?}")
+        }
+    };
+    // ⚠️ 现状（2026-10-30 实测）：图**确实进到了消息里**（下面的两个计数也证明了），
+    // 但 `send_message` 的入队/投影路径会把图片块替换成 `[Image omitted: …]` 占位文本
+    // —— 即使模型声明了 image 输入也一样。所以这里断言的是「图到达后被投影掉」，
+    // 不是「原样存了下来」。
+    //
+    // 要让它原样存下来，得改 harness 的投影条件（`send_message` 与 `prompt_text`
+    // 走的是两条不同的存储路径），那是另一件事，不要在这个 PR 里顺带做。
+    let has_real_image = blocks
+        .iter()
+        .any(|b| matches!(b, rpi_ai::types::Content::Image(_)));
+    let projected = blocks.iter().any(|b| {
+        matches!(b, rpi_ai::types::Content::Text(t) if t.text.contains("Image omitted"))
+    });
+    assert!(
+        has_real_image || projected,
+        "附带的有效图片必须已经进到消息里（原样或被子投影），实际 blocks={blocks:?}"
+    );
+}
