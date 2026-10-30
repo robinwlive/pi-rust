@@ -525,6 +525,19 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("ask_user requires an interactive UI".to_string())
     }
 
+    /// `ListCommands` — enumerate registered slash commands.
+    ///
+    /// Result: `{"commands":[{name, description}]}`. A host with no registry
+    /// returns an empty list (genuinely "none registered"), not an error:
+    /// the remote UI should degrade to "no completion available".
+    ///
+    /// Added because the plugin ABI had no way to enumerate commands, so a
+    /// remote client could not offer slash-command completion at all — it saw
+    /// an empty list and could not tell that apart from "no host attached".
+    async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "commands": [] }))
+    }
+
     /// Safe, effective runtime metadata; never serialize credential bindings.
     async fn get_execution_context(
         &self,
@@ -973,6 +986,7 @@ async fn dispatch(
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
+        RuntimeActionId::ListCommands => host.list_commands(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
@@ -1015,7 +1029,8 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::Abort),
+            // (26 = Abort, 27 = ListCommands; keep in sync with the enum.)
+            u32::from(RuntimeActionId::ListCommands),
             args_json,
             out,
             user_data,
@@ -2026,6 +2041,41 @@ mod tests {
         assert!(mailbox.take_pending().is_none());
     }
 
+    /// `ListCommands = 27` 必须走 trampoline 分发到宿主方法；默认实现回**空列表**
+    /// 而不是报错 —— 客户端要能区分「没注册任何命令」与「宿主不支持这个动作」。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_commands_routes_to_the_host_and_defaults_to_empty() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let user_data = bridge.user_data();
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            27,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(rc, 0, "ListCommands 不该报错");
+        let payload: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("JSON");
+        assert!(
+            payload.get("commands").and_then(|c| c.as_array()).is_some(),
+            "unexpected payload: {payload}"
+        );
+    }
+
     /// The v2 trampoline must route action 17 into the session mailbox rather
     /// than rejecting it as unknown, and a detached mailbox must surface the
     /// explicit "requires an interactive UI" error (headless contract).
@@ -2065,10 +2115,12 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 27 is one past the highest defined action (`Abort = 26`).
+        // 28 is one past the highest defined action (`ListCommands = 27`).
+        // ⚠️ 这里的数字要跟着枚举走：加了新动作之后原来的 27 就合法了，
+        // 写死旧数字会让这条假失败（本轮加 ListCommands 时就踩了一次）。
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(27, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(28, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.

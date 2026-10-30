@@ -1156,6 +1156,13 @@ pub enum RuntimeActionId {
     /// does **not** touch queued steer/follow-up messages — use `SendMessage`
     /// scheduling or the host's queue actions for those.
     Abort = 26,
+    /// Enumerate the registered slash commands. Args: `{}`; result:
+    /// `{"commands":[{"name":"…","description":"…"}]}`.
+    ///
+    /// A host with no extension registry returns an **empty list** rather than
+    /// an error: "none registered" is a real answer, and a client should
+    /// degrade to "no completion available" instead of surfacing a failure.
+    ListCommands = 27,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1203,6 +1210,7 @@ impl TryFrom<u32> for RuntimeActionId {
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
             26 => Ok(Self::Abort),
+            27 => Ok(Self::ListCommands),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }

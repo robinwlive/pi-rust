@@ -84,6 +84,14 @@ pub struct HarnessActionHost {
     side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
+    /// Loaded extension registry, set once the session's extensions are in.
+    ///
+    /// Needed by `ListCommands`: the plugin ABI had no way to enumerate slash
+    /// commands, so a remote UI could not offer completion. `None` before the
+    /// registry is published (and in tests that never load extensions) — the
+    /// action then answers with an empty list rather than failing, matching
+    /// the "no commands registered" case.
+    registry: std::sync::RwLock<Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>>,
 }
 
 impl HarnessActionHost {
@@ -112,9 +120,25 @@ impl HarnessActionHost {
                 children: crate::child_agents::ChildAgents::default(),
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
+                registry: std::sync::RwLock::new(None),
             },
             harness,
         )
+    }
+
+    /// Publish the loaded extension registry so `ListCommands` can answer.
+    ///
+    /// Called once after extension discovery (and again after a successful
+    /// `/reload`, which swaps in a fresh snapshot).
+    pub fn set_registry(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
+        if let Ok(mut g) = self.registry.write() {
+            *g = Some(snapshot);
+        }
+    }
+
+    /// Read the published registry, if any.
+    fn registry_snapshot(&self) -> Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>> {
+        self.registry.read().ok().and_then(|g| g.clone())
     }
 
     pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
@@ -494,6 +518,55 @@ impl RuntimeActionHost for HarnessActionHost {
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    /// `ListCommands` — enumerate registered slash commands.
+    ///
+    /// Shape matches the RPC mode's `rpc_get_commands` so both transports
+    /// report the same thing: `{"commands":[{name, description}]}`.
+    /// No registry published yet → empty list (that is genuinely "none
+    /// registered"), never an error: a remote UI should degrade to "no
+    /// completion" rather than show a failure.
+    async fn list_commands(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // 内建命令（/help /clear /model …）**不在插件注册表里** ——
+        // 它们在 TUI 的 `CommandRegistry`。只报扩展那半的话，远程客户端的
+        // 补全列表会缺掉最常用的那批，用户以为「rpi 没有命令」。
+        //
+        // 两半合并、内建优先（与 TUI 的 `build_builtin_registry()` +
+        // `register_extension_commands()` 同口径），并按名字去重。
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out: Vec<serde_json::Value> = Vec::new();
+
+        for entry in crate::interactive_tui::build_builtin_commands_for_abi() {
+            if seen.insert(entry.0.clone()) {
+                out.push(serde_json::json!({
+                    "name": entry.0,
+                    "description": entry.1,
+                    "source": "builtin",
+                }));
+            }
+        }
+        if let Some(snap) = self.registry_snapshot() {
+            for c in snap.commands() {
+                // 扩展命令名可能不带前导 `/`，统一补上（与 TUI 的规整一致）。
+                let name = if c.name.starts_with('/') {
+                    c.name.clone()
+                } else {
+                    format!("/{}", c.name)
+                };
+                if seen.insert(name.clone()) {
+                    out.push(serde_json::json!({
+                        "name": name,
+                        "description": c.description,
+                        "source": "extension",
+                    }));
+                }
+            }
+        }
+        Ok(serde_json::json!({ "commands": out }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,

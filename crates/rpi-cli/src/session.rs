@@ -429,6 +429,14 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
+    // Publish the extension registry so `ListCommands` can enumerate slash
+    // commands. Without this a remote client's `/` completion always came back
+    // empty, and it could not tell that apart from "no host attached".
+    // Done here (not at host construction): the registry is only known after
+    // extensions load, and a `/reload` rebuilds the host with a fresh one.
+    if let Some(snapshot) = extension_session.snapshot_arc() {
+        action_host.set_registry(snapshot);
+    }
     Ok(PreparedExtensions {
         session_dir,
         runtime,

@@ -561,6 +561,15 @@ impl AskUserBridge {
         Some(request)
     }
 
+    /// 兼容别名：与 `take_pending_excluding_reserved` 同义。
+    ///
+    /// 保留它是因为既有测试用例都用这个名字；而且"取一条给 TUI 显示的请求"
+    /// 本来就该跳过插件保留项 —— 用两个不同的名字做同一件事只会让人选错。
+    #[allow(dead_code)]
+    pub(super) fn take_pending(&self) -> Option<rpi_extensions::UiDialogRequest> {
+        self.take_pending_excluding_reserved()
+    }
+
     pub(super) fn clear_visible(&self, id: &str) {
         if let Ok(mut visible) = self.visible.lock() {
             if visible.as_deref() == Some(id) {

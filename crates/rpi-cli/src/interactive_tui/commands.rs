@@ -856,7 +856,7 @@ impl SlashCommand for ReloadCommand {
 /// fuzzy autocomplete tie), then the v1-out-of-scope stubs. Prompt-template
 /// commands are merged in separately by the autocomplete builder (they dispatch
 /// via template expansion, not this registry).
-pub(super) fn build_builtin_registry() -> CommandRegistry {
+pub(crate) fn build_builtin_registry() -> CommandRegistry {
     let mut r = CommandRegistry::new();
     r.register(Arc::new(HelpCommand));
     r.register(Arc::new(ClearChatCommand));

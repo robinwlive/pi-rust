@@ -370,6 +370,20 @@ impl CommandRegistry {
     }
 }
 
+/// 内建 slash 命令 → `(name, description)` 列表，给插件 ABI 的 `ListCommands`。
+///
+/// 为什么需要这个出口：`CommandRegistry` 在 TUI 模块里，而 `ListCommands`
+/// 跑在 `HarnessActionHost`（另一层）。没有它的话，远程客户端只能看到
+/// **扩展注册的**命令，内建的 `/help` `/clear` `/model` 等全部缺席 ——
+/// 补全列表看起来像空的。
+pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
+    build_builtin_registry()
+        .visible_entries()
+        .into_iter()
+        .map(|e| (e.name, e.description))
+        .collect()
+}
+
 /// Dispatch a ui_prompt_start event to extensions.
 fn dispatch_ui_prompt_event(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
