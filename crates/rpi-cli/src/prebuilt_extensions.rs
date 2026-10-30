@@ -1043,16 +1043,29 @@ fn read_budgeted(
 }
 
 /// Sidecar paths are relative, forward-slash and plain ASCII. Components cannot be
-/// empty, `.`, `..` or hidden, cannot be `node_modules`, and cannot carry a native
-/// library extension, because the loader scans the extension store for libraries.
+/// empty, `.`, `..` or hidden, cannot be a Windows device name or end in a dot,
+/// cannot be `node_modules`, and cannot carry a native library extension, because
+/// the loader scans the extension store for libraries.
 pub(crate) fn validate_asset_path(value: &str) -> Result<(), String> {
     let invalid = || format!("invalid asset path `{value}`");
     if value.is_empty() || value.len() > MAX_ASSET_PATH {
         return Err(invalid());
     }
     for component in value.split('/') {
+        // Windows maps these stems to devices even with an extension, and drops trailing dots.
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.as_bytes()[3].is_ascii_digit());
         if component.is_empty()
             || component.starts_with('.')
+            || component.ends_with('.')
+            || device
             || !component
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -1415,6 +1428,24 @@ mod tests {
                 ]),
                 vec![],
                 "invalid SHA-256",
+            ),
+            (
+                "windows device name",
+                index(vec![entry("runtime/CON.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "windows bare device name",
+                index(vec![entry("runtime/nul", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "windows trailing dot",
+                index(vec![entry("runtime/main.mjs.", worker)]),
+                vec![],
+                "invalid asset path",
             ),
             (
                 "empty component",
