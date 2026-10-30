@@ -7077,3 +7077,112 @@ mod recorded_recovery_tests {
         assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod startup_thinking_level_tests {
+    use super::*;
+    use crate::session::memory::{InMemorySessionStorage, SystemClock};
+    use crate::session::session::DefaultIdGenerator;
+    use crate::session::types::SessionMetadata;
+    use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+
+    async fn harness_at(level: ThinkingLevel) -> AgentHarness {
+        let provider = FauxProvider::new(FauxScript::new().with_text("ok"));
+        AgentHarness::create(AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider],
+            thinking_level: level,
+            session: Session::new(
+                Arc::new(InMemorySessionStorage::new(
+                    SessionMetadata {
+                        id: "startup-thinking".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Every `thinking_level_change` entry on the main branch, in order.
+    async fn thinking_entries(harness: &AgentHarness) -> Vec<String> {
+        let entries = harness
+            .session()
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some("thinking_level_change"),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .unwrap();
+        entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::ThinkingLevel(entry) => Some(entry.thinking_level),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A session running at a non-default level must say so in its own file,
+    /// otherwise no reader can tell `--thinking low` from the default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_default_level_is_recorded_before_the_first_model_call() {
+        let harness = harness_at(ThinkingLevel::Low).await;
+        // Nothing before the first turn: an entry here would be the session's
+        // leaf, and `fork` requires a message leaf.
+        assert!(thinking_entries(&harness).await.is_empty());
+
+        harness.prompt_text("hello", Vec::new()).await.unwrap();
+        assert_eq!(thinking_entries(&harness).await, vec!["low".to_string()]);
+    }
+
+    /// The default level writes nothing: the absence of an entry already says
+    /// `off`, and writing one for every session would be noise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_default_level_records_nothing() {
+        let harness = harness_at(ThinkingLevel::Off).await;
+        harness.prompt_text("hello", Vec::new()).await.unwrap();
+        assert!(thinking_entries(&harness).await.is_empty());
+    }
+
+    /// Later turns must not append a second entry for the same fact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subsequent_turns_do_not_duplicate_the_entry() {
+        let harness = harness_at(ThinkingLevel::High).await;
+        harness.prompt_text("one", Vec::new()).await.unwrap();
+        harness.prompt_text("two", Vec::new()).await.unwrap();
+        assert_eq!(thinking_entries(&harness).await, vec!["high".to_string()]);
+    }
+
+    /// Every level must round-trip through the entry's wire name, so a reader
+    /// parsing the JSONL gets the level back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_level_round_trips_through_its_wire_name() {
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
+        ] {
+            let harness = harness_at(level).await;
+            harness.prompt_text("hello", Vec::new()).await.unwrap();
+            let recorded = thinking_entries(&harness).await;
+            assert_eq!(recorded.len(), 1, "{level:?}");
+            let parsed: ThinkingLevel = serde_json::from_value(serde_json::json!(recorded[0]))
+                .unwrap_or_else(|error| panic!("{level:?} wrote {:?}: {error}", recorded[0]));
+            assert_eq!(parsed, level, "wire name {:?}", recorded[0]);
+        }
+    }
+}
