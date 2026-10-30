@@ -504,6 +504,15 @@ impl MessageQueue {
         }
     }
 
+    /// How many items are queued **for this lane**, without draining.
+    ///
+    /// Needed by the `pending_message_count` hook (the `turn_end`
+    /// `pendingMessages` field): the drain helpers below consume the queue,
+    /// so asking "how many are left?" with them would eat the messages.
+    fn len_for_lane(&self, lane: &str) -> usize {
+        self.pending.iter().filter(|item| item.lane == lane).count()
+    }
+
     /// Take every queued item for `lane`, keeping each item's id.
     ///
     /// The id matters: it is what the durable `queue_enqueued` record named, so
@@ -4347,6 +4356,20 @@ impl AgentHarness {
                     let queue = Arc::clone(&queue);
                     let settle = Arc::clone(&settle);
                     Box::pin(async move { harness.drain_injected(queue, &settle).await })
+                })
+            }),
+            // 只读的排队计数（**不消耗队列**）。
+            //
+            // 两个 drain hook 不能拿来问“还剩几条”：它们会把消息取走。
+            // 这里读的是 harness 自己的队列长度 —— 与 drain 读同一份数据，
+            // 所以界面上「⇥ 排队 N」与实际还在排队的条数不会脱节。
+            pending_message_count: Some({
+                let steer = Arc::clone(&snap.steering_queue);
+                let follow = Arc::clone(&snap.follow_up_queue);
+                // 队列是按 lane 分的，harness 绑定在 "main"（同 `create` 里的重建口径）。
+                Arc::new(move || {
+                    steer.lock().map(|q| q.len_for_lane("main")).unwrap_or(0)
+                        + follow.lock().map(|q| q.len_for_lane("main")).unwrap_or(0)
                 })
             }),
             before_tool_call: snap.before_tool_call.clone(),

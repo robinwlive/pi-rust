@@ -306,6 +306,7 @@ async fn run_loop(
                     AgentEvent::TurnEnd {
                         message: am,
                         tool_results: Vec::new(),
+                        pending_messages: pending_count(config),
                     },
                 )
                 .await;
@@ -371,6 +372,7 @@ async fn run_loop(
                 AgentEvent::TurnEnd {
                     message: am,
                     tool_results: tool_results.clone(),
+                    pending_messages: pending_count(config),
                 },
             )
             .await;
@@ -1630,6 +1632,18 @@ async fn drain_steering(config: &AgentLoopConfig) -> Vec<AgentMessage> {
     } else {
         Vec::new()
     }
+}
+
+/// How many messages are still queued (steering + follow-up), **without draining**.
+///
+/// Must not use `drain_steering` / `drain_follow_up`: those consume the queue.
+/// A host that does not install the hook reports 0 — same as "nothing queued".
+fn pending_count(config: &AgentLoopConfig) -> usize {
+    config
+        .pending_message_count
+        .as_ref()
+        .map(|f| f())
+        .unwrap_or(0)
 }
 
 /// Drain follow-up messages (empty vec if no hook).

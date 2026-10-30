@@ -163,6 +163,7 @@ pub fn translate_at(event: &AgentEvent, turn_index: Option<u64>) -> Option<Stabl
         AgentEvent::TurnEnd {
             message,
             tool_results,
+            pending_messages,
         } => {
             let mut payload: serde_json::Value =
                 serde_json::from_str(&turn_end_payload(message, tool_results.len()))
@@ -170,6 +171,8 @@ pub fn translate_at(event: &AgentEvent, turn_index: Option<u64>) -> Option<Stabl
             if let Some(index) = turn_index {
                 payload["turnIndex"] = serde_json::json!(index);
             }
+            // Additive: consumers that only know the older shape ignore it.
+            payload["pendingMessages"] = serde_json::json!(pending_messages);
             Some(StablePluginEvent::data(
                 tag,
                 StbString::from_string(payload.to_string()),
@@ -1073,6 +1076,7 @@ mod tests {
     use rpi_agent::types::AgentToolResult;
     use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, Usage};
     use rpi_plugin_sdk::EventTag;
+    use rpi_plugin_sdk::events::EventView;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1110,6 +1114,7 @@ mod tests {
             AgentEvent::TurnEnd {
                 message: am.clone(),
                 tool_results: vec![],
+                pending_messages: 0,
             },
             AgentEvent::MessageStart {
                 message: am.clone(),
@@ -1219,6 +1224,7 @@ mod tests {
         let event = translate(&AgentEvent::TurnEnd {
             message: assistant_with(StopReason::Stop, None),
             tool_results: vec![],
+            pending_messages: 0,
         })
         .unwrap();
         assert_eq!(event.tag, EventTag::TurnEnd);
@@ -1234,6 +1240,7 @@ mod tests {
                 &translate(&AgentEvent::TurnEnd {
                     message: assistant_with(reason, None),
                     tool_results: vec![],
+                    pending_messages: 0,
                 })
                 .unwrap(),
             );
@@ -1247,6 +1254,7 @@ mod tests {
             &translate(&AgentEvent::TurnEnd {
                 message: assistant_with(StopReason::Aborted, None),
                 tool_results: vec![],
+                pending_messages: 0,
             })
             .unwrap(),
         );
@@ -1257,6 +1265,7 @@ mod tests {
             &translate(&AgentEvent::TurnEnd {
                 message: assistant_with(StopReason::Error, Some("429 rate limited")),
                 tool_results: vec![],
+                pending_messages: 0,
             })
             .unwrap(),
         );
@@ -1271,6 +1280,7 @@ mod tests {
                     tool_result_message("c1"),
                     tool_result_message("c2"),
                 ],
+                pending_messages: 0,
             })
             .unwrap(),
         );
@@ -1284,6 +1294,7 @@ mod tests {
         let event = AgentEvent::TurnEnd {
             message: assistant_with(rpi_ai::types::StopReason::Stop, None),
             tool_results: vec![],
+            pending_messages: 0,
         };
         assert!(payload_json(&translate(&event).unwrap())["turnIndex"].is_null());
         assert_eq!(
@@ -1321,12 +1332,49 @@ mod tests {
         let end = translate(&AgentEvent::TurnEnd {
             message: assistant_with(rpi_ai::types::StopReason::Stop, None),
             tool_results: vec![],
+            pending_messages: 0,
         })
         .unwrap();
         // SAFETY: as above.
         let view = unsafe { EventView::from_raw(&end) };
         let payload = view.data_text().expect("turn_end must expose a payload");
         assert!(payload.contains("\"outcome\""), "{payload}");
+    }
+
+    /// `turn_end` 必须把「还有几条排在队列里」带出去（`pendingMessages`）。
+    ///
+    /// 这是 Dash 那条「⇥ 排队 N」指示器的**唯一数据源**：
+    /// 两个 drain hook 会把消息取走，不能拿来问「还剩几条」，
+    /// 所以计数单走一个只读 hook（`pending_message_count`）。
+    #[test]
+    fn turn_end_carries_pending_message_count() {
+        let end = translate(&AgentEvent::TurnEnd {
+            message: assistant_with(rpi_ai::types::StopReason::Stop, None),
+            tool_results: vec![],
+            pending_messages: 3,
+        })
+        .unwrap();
+        // SAFETY: `from_raw` only borrows; the event outlives the view.
+        let view = unsafe { EventView::from_raw(&end) };
+        let payload = view.data_text().expect("turn_end must expose a payload");
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            v["pendingMessages"], 3,
+            "排队的条数必须原样传出，否则圆界上的「排队 N」永远是 0（{payload}）"
+        );
+        // 反向：0 条时也要显式给出，而不是省略字段（省略会让消费方无从区分
+        // 「真的没排队」与「这个宿主不提供这一项」）。
+        let idle = translate(&AgentEvent::TurnEnd {
+            message: assistant_with(rpi_ai::types::StopReason::Stop, None),
+            tool_results: vec![],
+            pending_messages: 0,
+        })
+        .unwrap();
+        // SAFETY: as above.
+        let view = unsafe { EventView::from_raw(&idle) };
+        let v: serde_json::Value =
+            serde_json::from_str(&view.data_text().expect("payload")).unwrap();
+        assert_eq!(v["pendingMessages"], 0);
     }
 
     #[test]
@@ -1504,6 +1552,7 @@ mod tests {
             emitter.try_emit(AgentEvent::TurnEnd {
                 message: assistant_with(rpi_ai::types::StopReason::ToolUse, None),
                 tool_results: vec![],
+                pending_messages: 0,
             });
         }
 
