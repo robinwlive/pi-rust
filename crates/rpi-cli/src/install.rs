@@ -872,10 +872,9 @@ fn install_native_package_at_with_hook(
     }
     let mut stale_asset_targets = Vec::new();
     for old in &previous_assets {
-        if !assets
-            .iter()
-            .any(|asset| asset.path.eq_ignore_ascii_case(old))
-        {
+        // Exact match: on a case-sensitive store a case-only rename is a different file,
+        // and leaving the old one would orphan it. Windows lowercases identities in the transaction.
+        if !assets.iter().any(|asset| asset.path == *old) {
             stale_asset_targets.push(checked_asset_target(destination, old)?);
         }
     }
@@ -2526,6 +2525,55 @@ mod tests {
         assert!(!agent.metadata_path().exists());
         assert_no_native_transaction_files(agent.temp.path());
         assert_no_native_transaction_files(&extension_dir);
+    }
+
+    #[test]
+    fn native_asset_case_only_rename_prunes_the_old_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library v1").unwrap();
+        let first = [("Runtime/main.mjs", &b"worker v1"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &first),
+            std::slice::from_ref(&library),
+            &sidecars(&first),
+            false,
+        )
+        .unwrap();
+        let second = [("runtime/main.mjs", &b"worker v2"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"worker v2"
+        );
+        // The old name is no longer recorded, so it must not survive beside the new one.
+        fn store_files(dir: &Path) -> usize {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        store_files(&path)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+        assert_eq!(store_files(&destination), 2);
     }
 
     #[test]
