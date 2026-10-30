@@ -7186,3 +7186,126 @@ mod startup_thinking_level_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod state_change_entry_tests {
+    use super::*;
+    use crate::session::memory::{InMemorySessionStorage, SystemClock};
+    use crate::session::session::DefaultIdGenerator;
+    use crate::session::types::SessionMetadata;
+    use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+    use rpi_ai::types::UserMessage;
+
+    async fn harness() -> AgentHarness {
+        let provider = FauxProvider::new(FauxScript::new().with_text("ok"));
+        AgentHarness::create(AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider],
+            session: Session::new(
+                Arc::new(InMemorySessionStorage::new(
+                    SessionMetadata {
+                        id: "state-change".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 某个类型在 main 分支上的条数。
+    async fn count(harness: &AgentHarness, entry_type: &'static str) -> usize {
+        harness
+            .session()
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some(entry_type),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// 往会话里塞一条 user 消息（让分支不再是空的）。
+    async fn push_user(harness: &AgentHarness) {
+        harness
+            .session()
+            .append_message(AgentMessage::User(UserMessage::new("hi", 0)))
+            .await
+            .unwrap();
+    }
+
+    /// 空分支**不写**（否则非消息条目成了唯一叶子，`fork` 会坏）。
+    #[tokio::test]
+    async fn empty_branch_records_nothing() {
+        let h = harness().await;
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 0);
+    }
+
+    /// 思考强度：变了才写，同值不重复。
+    #[tokio::test]
+    async fn thinking_level_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 1);
+        // 幂等：同值再设一次不写第二条。
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 1);
+        // 再变一次 → 第二条。
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::High)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 2);
+    }
+
+    /// 模型：变了才写。
+    #[tokio::test]
+    async fn model_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        let mut m = h.get_model().await.unwrap();
+        m.id = "other-model".into();
+        h.lane("main").set_model(m.clone()).await.unwrap();
+        assert_eq!(count(&h, "model_change").await, 1);
+        h.lane("main").set_model(m).await.unwrap();
+        assert_eq!(count(&h, "model_change").await, 1, "同模型不该重复写");
+    }
+
+    /// 启用工具：变了才写。
+    #[tokio::test]
+    async fn active_tools_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        h.lane("main")
+            .set_active_tools(vec!["read".into(), "bash".into()])
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "active_tools_change").await, 1);
+        h.lane("main")
+            .set_active_tools(vec!["read".into(), "bash".into()])
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "active_tools_change").await, 1);
+    }
+}
