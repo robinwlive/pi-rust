@@ -1977,10 +1977,10 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 26 is one past the highest defined action.
+        // 27 is one past the highest defined action (`Abort = 26`).
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(26, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(27, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.
