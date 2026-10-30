@@ -547,12 +547,16 @@ impl AskUserBridge {
     /// Take the next pending request and mark it visible. Only the single key
     /// loop calls this while no other dialog is open, so the visible-id
     /// bookkeeping is race-free without a separate lock.
-    pub(super) fn take_pending(&self) -> Option<rpi_extensions::UiDialogRequest> {
+    ///
+    /// ��过插件保留项（`pidingo:` 前缀）—— 那些归 Dash 的闸消费。
+    pub(super) fn take_pending_excluding_reserved(&self) -> Option<rpi_extensions::UiDialogRequest> {
         let mut visible = self.visible.lock().ok()?;
         if visible.is_some() {
             return None;
         }
-        let request = self.mailbox.take_pending()?;
+        let request = self
+            .mailbox
+            .take_pending_filtered(|r| !self.mailbox.is_reserved(&r.request_id))?;
         *visible = Some(request.request_id.clone());
         Some(request)
     }

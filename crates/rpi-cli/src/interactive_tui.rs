@@ -1744,7 +1744,12 @@ pub async fn interactive_tui(
                 break;
             }
             if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
-                if let Some(request) = ask_user_for_key.take_pending() {
+                // ⚠️ 跳过插件保留的请求（`pidingo:` 前缀）：那些是给 Dash 的闸
+                // 消费的，TUI 抢走就会“弹在 tmux 里、Dash 界面上看不到”
+                // （用户就在 Dash 里，等于问题丢了）。
+                if let Some(request) = ask_user_for_key
+                    .take_pending_excluding_reserved()
+                {
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }

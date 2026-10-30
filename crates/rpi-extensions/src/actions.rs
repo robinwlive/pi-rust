@@ -61,6 +61,13 @@ use tokio::runtime::Handle;
 /// call may ask more than one question, while concurrent tool calls must never
 /// consume one another's answers. `raw` retains the complete action envelope;
 /// `ui` is the normalized UI payload that TUI renderers generally need.
+/// `requestId` 前缀：插件声明的“这一条不归 TUI 弹窗消费”。
+///
+/// 存在的原因：交互式 TUI 与插件刷同一个 `UiDialogMailbox`。如果没有这个约定，
+/// 插件（比如 Dash 的闸）提出的问题会被 TUI 抢走并画到终端里 ——
+/// 而我们的用户在 Dash 界面上，那里什么都看不到。
+pub const PLUGIN_RESERVED_PREFIX: &str = "pidingo:";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiDialogRequest {
     pub request_id: String,
@@ -139,15 +146,53 @@ impl UiDialogMailbox {
     /// Cancelled/answered requests are skipped; duplicate `open` calls never
     /// enqueue the same request id twice.
     pub fn take_pending(&self) -> Option<UiDialogRequest> {
+        self.take_pending_filtered(|_| true)
+    }
+
+    /// 同 [`take_pending`]，但只取满足 `keep` 的请求（不满足的**留在队列里**）。
+    ///
+    /// # 为什么需要
+    ///
+    /// 交互式 TUI 与插件会抢同一个信箱。当插件把一个请求标成「给宿主消费方」
+    /// （比如 Dash 的闸，见下），TUI 就不该把它抹走 —— 否则用户在
+    /// Dash 界面里永远看不到那个问题，而 tmux 里又弹出来一份。
+    ///
+    /// ## 保留前缀约定
+    ///
+    /// `requestId` 以 [`PLUGIN_RESERVED_PREFIX`] 开头的请求**永远不被 TUI 取走**：
+    /// TUI 用 `take_pending()`（默认全拿），它内部传 `|_| true` —— 所以调用方
+    /// 要跳过保留项就显式用 `take_pending_filtered(|r| !is_reserved(r))`。
+    pub fn take_pending_filtered<F>(&self, keep: F) -> Option<UiDialogRequest>
+    where
+        F: Fn(&UiDialogRequest) -> bool,
+    {
         let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
-        while let Some(request_id) = state.pending.pop_front() {
-            if let Some(entry) = state.active.get(&request_id) {
-                if !entry.cancelled && entry.answer.is_none() {
-                    return Some(entry.request.clone());
-                }
+        let mut scanned = 0usize;
+        let total = state.pending.len();
+        while scanned < total {
+            scanned += 1;
+            let Some(request_id) = state.pending.pop_front() else {
+                break;
+            };
+            let Some(entry) = state.active.get(&request_id) else {
+                continue;
+            };
+            if entry.cancelled || entry.answer.is_some() {
+                continue;
             }
+            let request = entry.request.clone();
+            if keep(&request) {
+                return Some(request);
+            }
+            // 不归我消费 —— 放回队尾，留给真正该处理它的那一方。
+            state.pending.push_back(request_id);
         }
         None
+    }
+
+    /// `requestId` 是不是插件保留的（TUI 不该消费）。
+    pub fn is_reserved(&self, request_id: &str) -> bool {
+        request_id.starts_with(PLUGIN_RESERVED_PREFIX)
     }
 
     pub fn pending_len(&self) -> usize {
@@ -1834,6 +1879,49 @@ mod tests {
         let mailbox = UiDialogMailbox::new();
         let error = mailbox.handle(open_args("r1", "c1")).unwrap_err();
         assert!(error.contains("interactive UI"), "got: {error}");
+    }
+
+    /// 插件保留的前缀：TUI 不能取走，但插件能自己取。
+    ///
+    /// 这条保护的是 Dash 那条路：交互式 TUI 与插件共用一个信箱，
+    /// 没这个区分的话，插件提的问题会被 TUI 抢去画到终端里，
+    /// 而用户就在 Dash 界面上 —— 等于问题丢了。
+    #[test]
+    fn reserved_prefix_is_invisible_to_the_tui_but_visible_to_the_plugin() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(open_args("pidingo:q1", "c1"))
+            .expect("open reserved");
+        mailbox.handle(open_args("r2", "c2")).expect("open plain");
+
+        // TUI 的口径：跳过保留项，拿到普通那条。
+        let tui = mailbox
+            .take_pending_filtered(|r| !mailbox.is_reserved(&r.request_id))
+            .expect("tui takes the unreserved one");
+        assert_eq!(tui.request_id, "r2");
+
+        // 插件的口径：只拿自己的。
+        let plugin = mailbox
+            .take_pending_filtered(|r| mailbox.is_reserved(&r.request_id))
+            .expect("plugin takes its own");
+        assert_eq!(plugin.request_id, "pidingo:q1");
+    }
+
+    /// 被跳过的项必须**留在队列**，不能因为“不是我的”就丢掉。
+    #[test]
+    fn filtered_take_keeps_non_matching_requests_queued() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+
+        assert!(
+            mailbox.take_pending_filtered(|r| mailbox.is_reserved(&r.request_id)).is_none(),
+            "不归插件的不该被取走"
+        );
+        assert_eq!(mailbox.pending_len(), 1, "它必须还在队列里");
+        // 真正该拿的人仍然能拿到。
+        assert_eq!(mailbox.take_pending().unwrap().request_id, "r1");
     }
 
     #[test]
