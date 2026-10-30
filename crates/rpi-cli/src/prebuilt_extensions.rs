@@ -1417,6 +1417,58 @@ mod tests {
                 "invalid SHA-256",
             ),
             (
+                "empty component",
+                index(vec![entry("runtime//main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "unc prefix",
+                index(vec![entry("\\\\server\\share\\main.mjs", worker)]),
+                vec![],
+                "invalid asset path",
+            ),
+            (
+                "missing digest",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len()}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "invalid runtime-assets.json",
+            ),
+            (
+                "uppercase digest",
+                index(vec![
+                    serde_json::json!({"path": "main.mjs", "size": worker.len(), "sha256": hash(worker).to_uppercase()}),
+                ]),
+                vec![("main.mjs", worker.to_vec())],
+                "invalid SHA-256",
+            ),
+            (
+                "traversing archive entry",
+                index(vec![]),
+                vec![("../escape.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "absolute archive entry",
+                index(vec![]),
+                vec![("/escape.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "backslash archive entry",
+                index(vec![entry("runtime/main.mjs", worker)]),
+                vec![("runtime\\main.mjs", worker.to_vec())],
+                "unsafe archive entry path",
+            ),
+            (
+                "case-folded archive entry",
+                index(vec![entry("runtime/main.mjs", worker)]),
+                vec![("Runtime/Main.mjs", worker.to_vec())],
+                "undeclared file in archive",
+            ),
+            (
                 "unknown schema",
                 serde_json::to_vec(&serde_json::json!({"schema_version": 2, "assets": []}))
                     .unwrap(),
@@ -1562,6 +1614,11 @@ mod tests {
             "{error}"
         );
         walk_archive(&archive, "zip", 24, |_, _, _| Ok(())).unwrap();
+
+        // The tar.gz stream is capped as well, so its framing counts toward the total.
+        let tar = tgz(&[("a.bin", &[0u8; 12][..]), ("b.bin", &[0u8; 12][..])]);
+        assert!(walk_archive(&tar, "tar.gz", 20, |_, _, _| Ok(())).is_err());
+        walk_archive(&tar, "tar.gz", 64 * 1024, |_, _, _| Ok(())).unwrap();
     }
 
     #[test]
@@ -1580,6 +1637,36 @@ mod tests {
             error.contains("runtime-assets.json exceeds size limit"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn runtime_asset_entry_count_is_exact() {
+        let library = object(TARGETS[0]);
+        let worker: &[u8] = b"export const ready = true;\n";
+        let names: Vec<String> = (0..126).map(|i| format!("assets/f{i}.mjs")).collect();
+        let assets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::json!({"path": name, "size": worker.len(), "sha256": hash(worker)}))
+            .collect();
+        let index = serde_json::to_vec(&serde_json::json!({"schema_version": 1, "assets": assets}))
+            .unwrap();
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("custom_runtime.dll", library.as_slice()),
+            ("runtime-assets.json", index.as_slice()),
+        ];
+        entries.extend(names.iter().map(|name| (name.as_str(), worker)));
+        // 126 sidecars plus the library and the index make the 128-entry ceiling.
+        let contents = extract_contents(&zip(&entries), "zip", "custom_runtime.dll").unwrap();
+        assert_eq!(contents.assets.len(), 126);
+
+        // A legacy archive is bounded by the same entry ceiling.
+        let legacy: Vec<String> = (0..129).map(|i| format!("docs/{i}.md")).collect();
+        let legacy: Vec<(&str, &[u8])> = legacy
+            .iter()
+            .map(|name| (name.as_str(), &b"x"[..]))
+            .collect();
+        let error = extract_library(&zip(&legacy), "zip", "custom_runtime.dll").unwrap_err();
+        assert!(error.contains("too many archive entries"), "{error}");
     }
 
     /// Rewrite the uncompressed size that the local and central headers of `name`
@@ -1720,6 +1807,72 @@ mod tests {
             panic!("a node_modules directory was accepted");
         };
         assert!(error.contains("node_modules"), "{error}");
+    }
+
+    #[test]
+    fn runtime_asset_digest_mismatch_keeps_the_installed_sidecars() {
+        let target = TARGETS[1];
+        let worker = b"export {};\n";
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "assets": [{"path": "runtime/main.mjs", "size": worker.len(), "sha256": hash(worker)}]
+        }))
+        .unwrap();
+        let (package, value, archive) = fixture_with_entries(
+            target,
+            &[
+                ("runtime-assets.json", &index[..]),
+                ("runtime/main.mjs", &worker[..]),
+            ],
+        );
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        install_archive_at(
+            &package,
+            &manifest,
+            &serde_json::to_vec(&value).unwrap(),
+            &archive,
+            target,
+            agent.path(),
+            false,
+        )
+        .unwrap();
+        let metadata = std::fs::read(agent.path().join("native-packages.json")).unwrap();
+
+        // The manifest and archive hashes are consistent. The sidecar keeps its size and changes its bytes.
+        let tampered: &[u8] = b"export [];\n";
+        assert_eq!(tampered.len(), worker.len());
+        let (package, value, archive) = fixture_with_entries(
+            target,
+            &[
+                ("runtime-assets.json", &index[..]),
+                ("runtime/main.mjs", tampered),
+            ],
+        );
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        let error = install_archive_at(
+            &package,
+            &manifest,
+            &serde_json::to_vec(&value).unwrap(),
+            &archive,
+            target,
+            agent.path(),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("asset runtime/main.mjs: SHA-256 mismatch"),
+            "{error}"
+        );
+        let extensions = agent.path().join("extensions");
+        assert_eq!(
+            std::fs::read(extensions.join("runtime/main.mjs")).unwrap(),
+            worker
+        );
+        assert_eq!(
+            std::fs::read(agent.path().join("native-packages.json")).unwrap(),
+            metadata
+        );
     }
 
     #[test]
