@@ -2303,6 +2303,76 @@ fn provider_login_saves_deepseek_key_and_restores_editor() {
     });
 }
 
+/// A login cancelled with Esc while its exchange ran must not save the
+/// credential that exchange returns late, and a newer flow does not adopt it.
+#[test]
+fn a_cancelled_provider_login_never_saves_a_late_credential() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let late = || {
+            Ok(serde_json::json!({
+                "version": 1,
+                "kind": "credential",
+                "payload": {"access": "late-access", "refresh": "late-refresh", "expires_at": 0}
+            }))
+        };
+
+        begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        let Ok(TuiMessage::ProviderOAuthAction {
+            flow_id: cancelled, ..
+        }) = rx.try_recv()
+        else {
+            panic!("begin was not sent");
+        };
+        finish_provider_login(&state, &editor_container, &editor, &tui);
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "exchange",
+            late(),
+            ProviderOAuthPurpose::Login,
+            cancelled,
+        );
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_none());
+
+        begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "exchange",
+            late(),
+            ProviderOAuthPurpose::Login,
+            cancelled,
+        );
+        assert!(
+            crate::config::read_oauth_token("acme").unwrap().is_none(),
+            "a newer flow saved the cancelled flow's credential"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the newer flow's own begin is still sent"
+        );
+        assert!(rx.try_recv().is_err(), "the stale result must not act");
+    });
+}
+
 /// Esc ends an OAuth flow through `finish_provider_login`, which cancels the
 /// call the flow started. The begin call and the exchange each carry the flow's
 /// token, so Esc reaches whichever call is running.

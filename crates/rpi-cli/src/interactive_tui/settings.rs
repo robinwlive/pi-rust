@@ -950,6 +950,15 @@ pub(super) fn handle_provider_oauth_result(
     purpose: ProviderOAuthPurpose,
     flow_id: u64,
 ) {
+    // A result from a flow that already ended (Esc, or a newer flow) must not
+    // act, so a login cancelled while its call ran can never save a credential.
+    if state
+        .provider_auth_flow_id
+        .load(std::sync::atomic::Ordering::Acquire)
+        != flow_id
+    {
+        return;
+    }
     let value = match result {
         Ok(value) => value,
         Err(error) => {

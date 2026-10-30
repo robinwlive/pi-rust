@@ -3477,13 +3477,6 @@ pub async fn interactive_tui(
                 purpose,
                 flow_id,
             }) => {
-                if state
-                    .provider_auth_flow_id
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != flow_id
-                {
-                    continue;
-                }
                 handle_provider_oauth_result(
                     &state,
                     &editor_container,

@@ -1014,19 +1014,15 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         let _ = fs::remove_file(marker);
     }
 
-    /// A current plugin registers through `register_oauth_provider_cancellable`.
-    /// Its `exchange` blocks until the host cancels a request that is in flight,
-    /// across the real cdylib boundary.
-    #[test]
-    fn cancellable_oauth_slot_delivers_host_cancellation_across_the_abi() {
-        let marker = std::env::temp_dir().join(format!("rpi-oauth-cancel-{}", std::process::id()));
-        let _ = fs::remove_file(&marker);
+    /// A current plugin on the `register_oauth_provider_cancellable` slot. Each
+    /// call marks "C", blocks until the host cancels it, then marks "K".
+    fn cancellable_oauth_fixture(name: &str, marker: &Path) -> CdylibFixture {
         let offset = std::mem::offset_of!(
             rpi_plugin_sdk::PluginApi,
             register_oauth_provider_cancellable
         );
-        let fixture = build_cdylib_fixture(
-            "oauth_cancellable_slot",
+        build_cdylib_fixture(
+            name,
             &format!(
                 r#"{OAUTH_FIXTURE_PRELUDE}
 #[repr(C)]
@@ -1063,7 +1059,17 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
 }}
 "#
             ),
-        );
+        )
+    }
+
+    /// A current plugin registers through `register_oauth_provider_cancellable`.
+    /// Its `exchange` blocks until the host cancels a request that is in flight,
+    /// across the real cdylib boundary.
+    #[test]
+    fn cancellable_oauth_slot_delivers_host_cancellation_across_the_abi() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-cancel-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let fixture = cancellable_oauth_fixture("oauth_cancellable_slot", &marker);
         let session = load_session_mixed(
             &[],
             std::slice::from_ref(&fixture.path),
@@ -1104,6 +1110,74 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         );
         // "C": the plugin saw a sized control. "K": it observed the cancellation.
         assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        let _ = fs::remove_file(marker);
+    }
+
+    /// Reload while a cancellable call is in flight: the old library stays
+    /// mapped until the call returns, cancellation still reaches it, and the
+    /// reloaded plugin serves new calls on its own.
+    #[test]
+    fn cancellable_oauth_call_survives_a_reload_and_still_cancels() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-reload-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let fixture = cancellable_oauth_fixture("oauth_cancellable_reload", &marker);
+        let load = || {
+            load_session_mixed(
+                &[],
+                std::slice::from_ref(&fixture.path),
+                Arc::new(NullDiagnostics),
+                None,
+            )
+        };
+        let old = load();
+        let (snapshot, keepalive) = (old.snapshot_arc().unwrap(), old.keepalive());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        // Holds the keepalive across the call, as the TUI's blocking task does.
+        let worker = std::thread::spawn(move || {
+            let _keepalive = keepalive;
+            crate::request_oauth_with_cancel(
+                &snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &worker_cancel,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read(&marker).unwrap_or_default() != b"C" {
+            assert!(std::time::Instant::now() < deadline, "call never started");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        old.begin_shutdown();
+        drop(old);
+        let reloaded = load();
+        cancel.cancel();
+        let result = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"CK");
+
+        let precancelled = tokio_util::sync::CancellationToken::new();
+        precancelled.cancel();
+        let result = crate::request_oauth_with_cancel(
+            &reloaded.snapshot_arc().expect("reloaded plugin registers"),
+            "acme",
+            "begin",
+            serde_json::json!({}),
+            &precancelled,
+        );
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"CK",
+            "a cancelled call reached the reloaded plugin"
+        );
         let _ = fs::remove_file(marker);
     }
 
