@@ -650,6 +650,22 @@ pub enum EventTag {
     AgentEnd = 17,
     AgentSettled = 18,
     TurnStart = 19,
+    /// End of one assistant turn, carrying a JSON `data` payload:
+    /// `{"outcome":"stop"|"aborted"|"error", "stopReason":"<raw>",
+    /// "toolResultCount":N, "pendingMessages":N}`.
+    ///
+    /// `outcome` is the normalized value to branch on: `stop` covers a normal
+    /// stop, a tool-use continuation and a token-ceiling truncation; `aborted`
+    /// means the run was cancelled; `error` covers every other termination.
+    ///
+    /// `pendingMessages` is how many user messages were still queued (steering
+    /// + follow-up) when the turn settled — the data behind an "N queued"
+    /// indicator.
+    ///
+    /// ABI note: hosts before this payload existed sent `turn_end` with an
+    /// **empty** payload. Read it via `EventView::data_text()`, which returns
+    /// `None` for an empty payload, so a consumer handles both without a
+    /// version probe.
     TurnEnd = 20,
     MessageStart = 21,
     MessageUpdate = 22,
@@ -870,7 +886,21 @@ impl StablePluginEvent {
         Self {
             tag,
             payload: EventPayload {
-                empty: EventEmpty::INSTANCE,
+                // Initialize the **largest** union member, not `EventEmpty`.
+                //
+                // `EventPayload` is a union: writing only `empty` (1 byte)
+                // leaves the remaining bytes — which `data` (`StbString`:
+                // ptr + len) would read — uninitialized. A reader that checks
+                // the tag cannot know whether *this* host wrote the `data` arm,
+                // and a tag an older host sent as no-payload must still be
+                // readable as "no data".
+                //
+                // Writing an empty `StbString` here makes every subsequent
+                // `payload.data.data` read defined, encoding "no payload" as an
+                // empty string rather than as indeterminate bytes.
+                data: EventData {
+                    data: StbString::empty(),
+                },
             },
         }
     }

@@ -66,11 +66,35 @@ impl<'a> EventView<'a> {
                 | EventTag::UiPromptStart
                 | EventTag::UiPromptEnd
                 | EventTag::EditorChange
+                // `turn_end` carries `{outcome, stopReason, toolResultCount,
+                // pendingMessages}`.
+                //
+                // Compatibility note: a host built against a **pre-payload**
+                // SDK sends this tag with `StablePluginEvent::empty`, which
+                // used to initialize only the (1-byte) `EventEmpty` arm while
+                // `data` is a 16-byte `StbString`. Reading `data` there is
+                // undefined regardless of what we do with the result, so the
+                // fix lives on the writing side: `StablePluginEvent::empty`
+                // now initializes the `data` arm with an empty `StbString`,
+                // making every read well-defined.
+                //
+                // An old host binary still does the old thing. It is only
+                // reachable if it passed the ABI handshake, and the reader
+                // contract (`EventView::from_raw`) already requires the host to
+                // initialize the variant its tag names — a pre-payload host
+                // predates that requirement for this tag. Consumers must
+                // therefore treat `None`/empty as "host does not report
+                // payloads" and remain functional without it.
+                | EventTag::TurnEnd
         ) {
             return None;
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
-        Some(unsafe { self.raw.payload.data.data.to_string_lossy() })
+        let text = unsafe { self.raw.payload.data.data.to_string_lossy() };
+        // An older host sends `turn_end` with the empty variant, whose `data`
+        // field is a null `StbString`. Surface that as `None` so a consumer's
+        // `?`-chain degrades to "no payload" instead of parsing `""`.
+        (!text.is_empty()).then_some(text)
     }
 
     pub fn tool_call(&self) -> Option<ToolCall> {
@@ -219,5 +243,52 @@ mod tests {
             ),
             crate::EVENT_HANDLER_ERROR
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_payload_tests {
+    use super::*;
+    use crate::{StablePluginEvent, StbString};
+
+    /// A host that predates the `turn_end` payload sends `empty`. Reading
+    /// `data_text()` on it must return `None` **without** reading uninitialized
+    /// union bytes.
+    ///
+    /// `EventPayload` is a union; before this the empty variant only initialized
+    /// 1 byte while `data` (`StbString`: ptr + len) is larger, so the read was
+    /// undefined no matter that the result was then treated as empty.
+    #[test]
+    fn empty_payload_reads_as_no_data_instead_of_garbage() {
+        let event = StablePluginEvent::empty(EventTag::TurnEnd);
+        let view = unsafe { EventView::from_raw(&event) };
+        assert_eq!(
+            view.data_text(),
+            None,
+            "an old host's empty turn_end must read as \"no payload\""
+        );
+    }
+
+    /// A host that does send a payload still round-trips.
+    #[test]
+    fn a_real_payload_still_reads_back() {
+        let event = StablePluginEvent::data(
+            EventTag::TurnEnd,
+            StbString::from_string("{\"pendingMessages\":2}".to_string()),
+        );
+        let view = unsafe { EventView::from_raw(&event) };
+        assert_eq!(view.data_text().as_deref(), Some("{\"pendingMessages\":2}"));
+    }
+
+    /// `empty` and `data` must agree on the "no payload" encoding, so a reader
+    /// cannot distinguish them by accident.
+    #[test]
+    fn empty_and_empty_data_are_both_no_payload() {
+        let via_empty = StablePluginEvent::empty(EventTag::TurnEnd);
+        let via_data = StablePluginEvent::data(EventTag::TurnEnd, StbString::empty());
+        for event in [via_empty, via_data] {
+            let view = unsafe { EventView::from_raw(&event) };
+            assert_eq!(view.data_text(), None);
+        }
     }
 }

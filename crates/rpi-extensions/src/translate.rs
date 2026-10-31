@@ -52,6 +52,38 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     StbString::from_string(text)
 }
 
+/// Normalize an assistant `StopReason` into the value a plugin branches on.
+///
+/// `stop`, `toolUse` and `length` are all *successful* terminations of a turn:
+/// the run is going to continue (or ended cleanly) either way. `aborted` is the
+/// user cancelling. Everything else is a failure.
+fn turn_outcome(stop_reason: rpi_ai::types::StopReason) -> &'static str {
+    use rpi_ai::types::StopReason;
+    match stop_reason {
+        StopReason::Stop | StopReason::ToolUse | StopReason::Length => "stop",
+        StopReason::Aborted => "aborted",
+        _ => "error",
+    }
+}
+
+/// Payload for `turn_end`.
+///
+/// Carries enough for a plugin to tell a normal stop from a failure or a user
+/// abort without inferring it from the last `message_end`, plus
+/// `pendingMessages` — the queue depth **after** this turn settled.
+fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: usize) -> String {
+    let stop_reason = message
+        .as_assistant()
+        .map(|assistant| assistant.stop_reason);
+    let outcome = stop_reason.map(turn_outcome).unwrap_or("error");
+    serde_json::json!({
+        "outcome": outcome,
+        "stopReason": stop_reason.map(|reason| reason.as_str()),
+        "toolResultCount": tool_results,
+    })
+    .to_string()
+}
+
 /// Build the stable event for an `AgentEvent`, or `None` if the event carries
 /// no payload that maps onto a stable variant (always maps today, but kept as
 /// `Option` for forward-compat with unmapped future variants). Ownership of any
@@ -111,11 +143,34 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             ))
         }
 
+        // `turn_end` carries a payload so a plugin can tell a normal stop from
+        // a failure or a user abort without inferring it from the last
+        // `message_end`, and so a remote UI can show "N queued".
+        //
+        // `pendingMessages` is the queue depth **after** the turn settled. The
+        // drain hooks cannot answer this (they consume the queue), which is why
+        // the agent loop reports it through a read-only `pending_message_count`
+        // hook instead.
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            pending_messages,
+        } => {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&turn_end_payload(message, tool_results.len()))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            // Additive: consumers that only know the older (empty) shape ignore it.
+            payload["pendingMessages"] = serde_json::json!(pending_messages);
+            Some(StablePluginEvent::data(
+                tag,
+                StbString::from_string(payload.to_string()),
+            ))
+        }
+
         // No-payload events.
-        AgentEvent::AgentStart
-        | AgentEvent::TurnStart
-        | AgentEvent::AgentEnd { .. }
-        | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
+        AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::AgentEnd { .. } => {
+            Some(StablePluginEvent::empty(tag))
+        }
 
         AgentEvent::RetryScheduled { .. } => None,
     }
@@ -991,6 +1046,50 @@ mod tests {
     // before the test returns — no handler outlives the test.
     static HANDLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// `turn_end` must carry `pendingMessages`, and it must be the queue depth
+    /// **after** the turn settled.
+    ///
+    /// This is the only data source for a remote UI's "N queued" indicator: the
+    /// drain hooks consume the queue, so the count has to come from the
+    /// read-only `pending_message_count` hook.
+    #[test]
+    fn turn_end_carries_pending_message_count() {
+        let assistant = AgentMessage::Assistant(Box::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("hi")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: rpi_ai::types::StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }));
+        let event = AgentEvent::TurnEnd {
+            message: assistant,
+            tool_results: vec![],
+            pending_messages: 3,
+        };
+        let translated = translate(&event).expect("turn_end maps to a tag");
+        assert_eq!(translated.tag, EventTag::TurnEnd);
+        // SAFETY: `TurnEnd` carries the `data` variant; discriminating by tag is
+        // the documented contract for this union.
+        let payload = unsafe { translated.payload.data.data.to_string_lossy() };
+        assert!(
+            !payload.is_empty(),
+            "turn_end must carry a payload (an older host sent none)"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(parsed["pendingMessages"], 3, "{payload}");
+        assert_eq!(parsed["outcome"], "stop", "{payload}");
+        assert_eq!(parsed["toolResultCount"], 0, "{payload}");
+    }
+
     #[test]
     fn all_ten_agent_events_map_to_a_tag() {
         let am = AgentMessage::Assistant(Box::new(AssistantMessage {
@@ -1016,6 +1115,7 @@ mod tests {
             AgentEvent::TurnEnd {
                 message: am.clone(),
                 tool_results: vec![],
+                pending_messages: 0,
             },
             AgentEvent::MessageStart {
                 message_id: None,

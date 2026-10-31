@@ -173,6 +173,7 @@ impl RemoteEvent {
             AgentEvent::TurnEnd {
                 message,
                 tool_results,
+                ..
             } => RemoteEvent::TurnEnd {
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
                 tool_result_count: tool_results.len(),
