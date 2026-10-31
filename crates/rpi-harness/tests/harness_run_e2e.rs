@@ -4129,3 +4129,97 @@ async fn resuming_through_a_provider_without_the_capability_is_an_error() {
         "the error must say which provider is missing, got {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// StopRound: "finish the current turn, then stop" — the gentle counterpart of
+// abort. The host sets a one-shot flag; the loop must consume it at the next
+// turn boundary and NOT carry it into a later prompt.
+//
+// This is the behaviour the plugin ABI's `StopRound = 29` relies on, and until
+// now it had no test at the harness level (only "the default impl errors").
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_halts_after_the_current_turn_and_does_not_leak() {
+    // Two scripted turns: a tool call (so the loop wants to continue) then a
+    // final text answer. Without stop_round both run; with it the loop must
+    // stop at the first turn boundary — i.e. the provider is called once.
+    let script = FauxScript::new().with_tool_call("bash", serde_json::json!({ "command": "true" }));
+    script.append_responses(vec![FauxStep::text("should not be reached")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // Arm before the run: the flag is consumed at the first turn boundary.
+    harness.request_stop_round();
+    let result = harness
+        .prompt_text("run a command", vec![])
+        .await
+        .expect("prompt_text completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "stopping early is a clean completion, not an error: {:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "stop_round must prevent the NEXT turn, so the provider is called once"
+    );
+
+    // The flag was consumed — a fresh prompt must be allowed to run normally.
+    // Script one more turn so a leaked flag would be immediately visible (the
+    // loop would stop before ever calling the provider).
+    provider.script().append_responses(vec![FauxStep::text("second run")]);
+    let before = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let result = harness
+        .prompt_text("second prompt", vec![])
+        .await
+        .expect("second prompt_text completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "second run completes: {:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        before + 1,
+        "a consumed stop_round flag must not silently stop the next prompt"
+    );
+}
+
+/// Setting `stop_round` while idle is a harmless no-op: the next prompt (which
+/// is what "idle" means) runs normally because the flag was consumed by that
+/// run's first turn boundary — but a run that produces its answer in ONE turn
+/// would already be over. Assert the flag does not make a later run error out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_while_idle_does_not_break_the_next_run() {
+    let script = FauxScript::new().with_text("fine");
+    let (harness, provider, _env) = harness_with(script).await;
+
+    harness.request_stop_round();
+    let result = harness
+        .prompt_text("hello", vec![])
+        .await
+        .expect("prompt_text completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "idle stop_round must not turn the next answer into an error: {:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the single turn still produced its answer"
+    );
+}

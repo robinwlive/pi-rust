@@ -4411,10 +4411,14 @@ impl AgentHarness {
             pending_message_count: Some({
                 let steer = Arc::clone(&snap.steering_queue);
                 let follow = Arc::clone(&snap.follow_up_queue);
-                // 队列是按 lane 分的，harness 绑定在 "main"（同 `create` 里的重建口径）。
+                // 队列是按 lane 分的，所以必须问**本 harness 自己的 lane**，
+                // 不能写死 "main"：`AgentHarness::lane(name)` 造出来的子 lane
+                // 跑的是同一个 `run_admitted_inner`，写死会让它们的排队数
+                // 被算进 main（或永远算成 0）。主 harness 的 lane 本来就是 "main"。
+                let lane = self.lane.clone();
                 Arc::new(move || {
-                    steer.lock().map(|q| q.len_for_lane("main")).unwrap_or(0)
-                        + follow.lock().map(|q| q.len_for_lane("main")).unwrap_or(0)
+                    steer.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
+                        + follow.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
                 })
             }),
             before_tool_call: snap.before_tool_call.clone(),
