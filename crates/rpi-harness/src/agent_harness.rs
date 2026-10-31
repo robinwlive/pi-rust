@@ -691,6 +691,16 @@ pub struct AgentHarness {
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
+    /// One-shot "finish this turn, then stop" request (runtime action
+    /// `StopRound`).
+    ///
+    /// This is the gentle counterpart of abort: it does not interrupt the
+    /// in-flight provider call or running tools, it only prevents the loop from
+    /// starting another turn — which is what "stop after this round" means to a
+    /// user who does not want the current answer truncated.
+    ///
+    /// Consumed at the next turn boundary, so it never leaks into the next prompt.
+    stop_round: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A session write that failed after the run had already decided to continue.
@@ -758,6 +768,19 @@ mod weak;
 pub use weak::WeakAgentHarness;
 
 impl AgentHarness {
+    /// "Finish the current turn, then stop" — the gentle counterpart of abort.
+    ///
+    /// Abort interrupts the in-flight provider call and running tools; this only
+    /// prevents the loop from starting **another** turn, so the current answer
+    /// is not truncated.
+    ///
+    /// One-shot: consumed at the next turn boundary, so it never leaks into a
+    /// later prompt. Setting it while idle is a harmless no-op.
+    pub fn request_stop_round(&self) {
+        self.stop_round
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Construct from options. Mirrors TS `AgentHarness.create`: when the
     /// session already has records (a prior operation) the default is to
     /// reject (TS throws `HarnessNotImplemented("create.restore")`). The
@@ -889,6 +912,7 @@ impl AgentHarness {
             child_scope,
             is_child: false,
             max_turns: None,
+            stop_round: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         if options.allow_existing_session {
             let messages = harness.flush_context_messages_locked().await?;
@@ -1298,6 +1322,7 @@ impl AgentHarness {
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         })
     }
 
@@ -4327,18 +4352,44 @@ impl AgentHarness {
             Some(limit) => crate::run_budget::RunBudget::new(limit),
             None => crate::run_budget::RunBudget::from_env(),
         }));
-        let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
-            if run_budget.lock().unwrap().is_enabled() {
-                let budget = Arc::clone(&run_budget);
-                Some(Arc::new(
-                    move |_ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, bool> {
-                        let budget = Arc::clone(&budget);
-                        Box::pin(async move { budget.lock().unwrap().observe_turn().is_some() })
-                    },
-                ))
-            } else {
-                None
-            };
+        // `should_stop_after_turn` is `Option<fn>` — only one hook fits — so the
+        // turn budget and the user's `StopRound` request share it. Either one
+        // being true ends the run at the turn boundary.
+        //
+        // Clear any request left over from an *idle* call: the documented
+        // contract is that `StopRound` on an idle lane is a no-op, and without
+        // this the flag would be consumed by the next run's first turn
+        // boundary — i.e. the next prompt would stop after one turn as if the
+        // user had asked it to.
+        self.stop_round
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stop_round_flag = Arc::clone(&self.stop_round);
+        let budget_enabled = run_budget.lock().unwrap().is_enabled();
+        let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> = if budget_enabled {
+            let budget = Arc::clone(&run_budget);
+            Some(Arc::new(
+                move |_ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, bool> {
+                    let budget = Arc::clone(&budget);
+                    let flag = Arc::clone(&stop_round_flag);
+                    Box::pin(async move {
+                        // The user's "stop after this round" wins and is
+                        // **one-shot**: consume the flag, or the next prompt
+                        // would stop immediately too.
+                        let requested = flag.swap(false, std::sync::atomic::Ordering::SeqCst);
+                        requested || budget.lock().unwrap().observe_turn().is_some()
+                    })
+                },
+            ))
+        } else {
+            // No turn ceiling, but the hook must still exist — without it
+            // `StopRound` has nowhere to take effect.
+            Some(Arc::new(
+                move |_ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, bool> {
+                    let flag = Arc::clone(&stop_round_flag);
+                    Box::pin(async move { flag.swap(false, std::sync::atomic::Ordering::SeqCst) })
+                },
+            ))
+        };
 
         let retry_policy = snap.retry.clone();
         let mut retry_attempt = 0u32;
@@ -5695,6 +5746,8 @@ pub struct LaneHandle {
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
+    /// Shared with the owning harness so a stop request reaches the run loop.
+    stop_round: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LaneHandle {
@@ -5710,6 +5763,7 @@ impl LaneHandle {
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         }
     }
 }

@@ -391,6 +391,11 @@ impl RuntimeActionHost for HarnessActionHost {
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.harness()?.request_stop_round();
+        Ok(serde_json::json!({ "requested": true }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,

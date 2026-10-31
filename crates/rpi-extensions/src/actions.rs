@@ -473,6 +473,19 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
+    /// Finish the current turn, then stop — the gentle counterpart of
+    /// [`Self::abort`].
+    ///
+    /// Args: `{}`; result: `{"requested": true}`. The flag is one-shot and
+    /// cleared when the next run starts, so setting it while idle is harmless.
+    ///
+    /// The default implementation reports "requested" without acting: a host
+    /// with no run loop has nothing to stop at a turn boundary, and returning an
+    /// error would make a plugin treat a benign call as a failure.
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "requested": true }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,
@@ -922,6 +935,7 @@ async fn dispatch(
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
+        RuntimeActionId::StopRound => host.stop_round(args),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -960,8 +974,8 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SideQuestion),
+            // Highest id this ABI defines.
+            rpi_plugin_sdk::RuntimeActionId::MAX,
             args_json,
             out,
             user_data,
@@ -2092,4 +2106,55 @@ impl Drop for ActionBridge {
 }
 
 #[cfg(test)]
-mod runtime_tests;
+mod runtime_tests    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    ///
+    /// A branch that adds an action but leaves the ceiling behind compiles,
+    /// keeps every other test green, and quietly makes the newest action
+    /// un-dispatchable. The ceiling and the enum live in different crates, so
+    /// nothing but a test can notice the drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_ceiling_matches_the_highest_defined_action() {
+        let highest = RuntimeActionId::MAX;
+        assert_eq!(
+            highest,
+            RuntimeActionId::ALL
+                .iter()
+                .copied()
+                .map(u32::from)
+                .max()
+                .unwrap(),
+            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
+        );
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            highest,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            bridge.user_data(),
+        );
+        assert_ne!(
+            rc, 2,
+            "the highest defined action id ({highest}) must not be rejected as unknown — \
+             the trampoline ceiling is stale"
+        );
+        if rc == 0 {
+            // SAFETY: success means the trampoline wrote a live host allocation.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(crate::host_free_string),
+                )
+            });
+        }
+    }
+
+}

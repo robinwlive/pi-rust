@@ -33,7 +33,9 @@
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage, CollectorEmitter};
-use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
+use rpi_ai::providers::faux::{
+    faux_assistant_message, FauxBlock, FauxProvider, FauxScript, FauxStep,
+};
 use rpi_ai::types::{UserContent, UserMessage};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
@@ -4626,4 +4628,97 @@ mod native_identity_bind_failure {
             "no identity is published after a failed durable binding"
         );
     }
+}
+
+/// `StopRound` ends the run at the turn boundary **without** truncating the
+/// answer, and is one-shot.
+///
+/// This is the gentle counterpart of abort: abort interrupts the in-flight
+/// provider call, so the answer the user is reading gets cut off. "Stop after
+/// this round" must instead let the current turn finish and only prevent the
+/// loop from starting another one.
+///
+/// The request is issued while the run is **active**, which is the only case
+/// where it has an effect (see `stop_round_while_idle_is_a_no_op`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_finishes_the_turn_then_stops() {
+    // First turn: some text **then** a tool call, streamed slowly. The text
+    // gives the test a window to issue the request while the turn is still
+    // running; without it the turn can complete before `request_stop_round()`.
+    let first = FauxStep::Message(faux_assistant_message(
+        vec![
+            FauxBlock::text("working on it"),
+            FauxBlock::tool_call("bash", serde_json::json!({ "command": "true" })),
+        ],
+        rpi_ai::types::StopReason::ToolUse,
+    ));
+    // 4 tokens/s over ~6 tokens ≈ 1.5s: long enough to inject the request,
+    // short enough to keep the suite fast.
+    let script = FauxScript::new().with_tokens_per_second(4.0);
+    script.set_responses(vec![first, FauxStep::text("second turn")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let prompt = tokio::spawn({
+        let harness = harness.clone();
+        async move { harness.prompt_text("go", vec![]).await }
+    });
+
+    // 4 tokens/s ⇒ the first chunk lands well after this sleep, so the request
+    // is set while the turn is still in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    harness.request_stop_round();
+
+    let result = prompt.await.unwrap().expect("the prompt still settles");
+
+    // The run completed rather than aborting: the first turn's answer is intact.
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "StopRound must complete the run, not abort it: {:?}",
+        result.outcome
+    );
+    // And the second turn never happened — only the first provider call ran.
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the loop must not start another turn after StopRound"
+    );
+}
+
+/// `StopRound` on an **idle** lane is a no-op: it must not make the next run
+/// stop after its first turn.
+///
+/// The request only means something while a run is in flight ("finish *this*
+/// round"). A leftover flag would silently turn the next prompt into a
+/// one-turn run, which is exactly what the previous implementation did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_round_while_idle_is_a_no_op() {
+    // Two turns would be needed for the tool call to continue, so a leaked flag
+    // would be visible as "the run stopped after turn one".
+    let script = FauxScript::new().with_tool_call("bash", serde_json::json!({ "command": "true" }));
+    script.append_responses(vec![FauxStep::text("second turn")]);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // No run is active.
+    harness.request_stop_round();
+
+    let result = harness
+        .prompt_text("one", vec![])
+        .await
+        .expect("the prompt settles");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "an idle StopRound must not stop the next run after one turn"
+    );
 }
