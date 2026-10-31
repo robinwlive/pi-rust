@@ -55,19 +55,22 @@ impl Drop for InvocationGuard {
 use rpi_plugin_sdk::{RuntimeActionId, StbString, StbStringRef};
 use tokio::runtime::Handle;
 
+/// 插件声明的「这一条不归 TUI 弹窗消费」的 `requestId` 前缀。
+///
+/// 存在的原因：交互式 TUI 与插件刷同一个 [`UiDialogMailbox`]。如果没有这个约定，
+/// 插件（比如 Dash 的闸）提出的问题会被 TUI 抢走并画到终端里 ——
+/// 而我们的用户在 Dash 界面上，那里什么都看不到。
+///
+/// 配套用法：[`UiDialogMailbox::take_pending_filtered`]
+/// （TUI 传 `|r| !is_reserved(&r.request_id)`）。
+pub const PLUGIN_RESERVED_PREFIX: &str = "pidingo:";
+
 /// A pending host UI request emitted by a plugin runtime action.
 ///
 /// The request and tool-call ids are intentionally separate: a single tool
 /// call may ask more than one question, while concurrent tool calls must never
 /// consume one another's answers. `raw` retains the complete action envelope;
 /// `ui` is the normalized UI payload that TUI renderers generally need.
-/// `requestId` 前缀：插件声明的“这一条不归 TUI 弹窗消费”。
-///
-/// 存在的原因：交互式 TUI 与插件刷同一个 `UiDialogMailbox`。如果没有这个约定，
-/// 插件（比如 Dash 的闸）提出的问题会被 TUI 抢走并画到终端里 ——
-/// 而我们的用户在 Dash 界面上，那里什么都看不到。
-pub const PLUGIN_RESERVED_PREFIX: &str = "pidingo:";
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiDialogRequest {
     pub request_id: String,
@@ -160,8 +163,9 @@ impl UiDialogMailbox {
     /// ## 保留前缀约定
     ///
     /// `requestId` 以 [`PLUGIN_RESERVED_PREFIX`] 开头的请求**永远不被 TUI 取走**：
-    /// TUI 用 `take_pending()`（默认全拿），它内部传 `|_| true` —— 所以调用方
-    /// 要跳过保留项就显式用 `take_pending_filtered(|r| !is_reserved(r))`。
+    /// `take_pending()` 默认全拿（内部传 `|_| true`），所以要跳过保留项就必须
+    /// 显式用 `take_pending_filtered(|r| !is_reserved(r))` —— 交互式 TUI 走的是
+    /// 后者（`AskUserBridge::take_pending_for_tui`）。
     pub fn take_pending_filtered<F>(&self, keep: F) -> Option<UiDialogRequest>
     where
         F: Fn(&UiDialogRequest) -> bool,
@@ -199,22 +203,23 @@ impl UiDialogMailbox {
     /// 所以后续 `respond` / `cancel`（按同一个 requestId）照常生效。
     pub fn take_all_unreserved(&self) -> Vec<UiDialogRequest> {
         let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
-        let mut keep: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         let mut out: Vec<UiDialogRequest> = Vec::new();
-        while let Some(request_id) = state.pending.pop_front() {
+        // 一次遍历就能同时做到「取走非保留项」与「保留项留在原位」：
+        // 先把整个队列拿出来，再把留下的放回去 —— 比逐个 pop 再重建少一层中间容器。
+        let drained = std::mem::take(&mut state.pending);
+        for request_id in drained {
             let Some(entry) = state.active.get(&request_id) else {
                 continue;
             };
             if entry.cancelled || entry.answer.is_some() {
                 continue;
             }
-            if self.is_reserved(&request_id) {
-                keep.push_back(request_id);
+            if request_id.starts_with(PLUGIN_RESERVED_PREFIX) {
+                state.pending.push_back(request_id);
             } else {
                 out.push(entry.request.clone());
             }
         }
-        state.pending = keep;
         out
     }
 
@@ -573,6 +578,18 @@ pub trait RuntimeActionHost: Send + Sync {
     async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({ "commands": [] }))
     }
+
+    /// Publish a freshly loaded extension registry to the host.
+    ///
+    /// Called after extension discovery **and after a successful `/reload`**, so
+    /// `ListCommands` keeps answering with the current command set. Hosts that
+    /// do not cache a registry (RPC mode reads the snapshot directly) keep the
+    /// default no-op.
+    ///
+    /// Why it is on the trait instead of a downcast: `/reload` only has the
+    /// `Arc<dyn RuntimeActionHost>` from the old bridge, so there is no concrete
+    /// type to downcast to. A default no-op keeps every other host source-compatible.
+    fn publish_registry(&self, _snapshot: std::sync::Arc<crate::registry::RegistrySnapshot>) {}
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
     async fn get_execution_context(
@@ -2146,7 +2163,7 @@ mod tests {
         let user_data = bridge.user_data();
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            29,
+            u32::from(RuntimeActionId::StopRound),
             StbStringRef::from_str("{}"),
             &mut out,
             user_data,
@@ -2170,7 +2187,7 @@ mod tests {
         let user_data = bridge.user_data();
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            27,
+            u32::from(RuntimeActionId::ListCommands),
             StbStringRef::from_str("{}"),
             &mut out,
             user_data,
