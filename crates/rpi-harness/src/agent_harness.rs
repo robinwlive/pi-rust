@@ -3474,6 +3474,86 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Write the initial `thinking_level_change` entry for a session, once.
+    ///
+    /// Mirrors pi, which records the level at startup rather than only on a
+    /// mid-session switch. Skipped when:
+    /// - the level is the default (`Off`) — the absence of an entry already says
+    ///   so, and writing one for every default session is noise;
+    /// - the branch already carries a `thinking_level_change` (later turns of
+    ///   the same session, and resumed sessions) — a second entry would
+    ///   duplicate the fact.
+    async fn record_startup_thinking_level(&self) -> HarnessResult<()> {
+        let level = self.inner.lock().unwrap().thinking_level;
+        if level == ThinkingLevel::default() {
+            return Ok(());
+        }
+        let existing = self
+            .session
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some("thinking_level_change"),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .map_err(session_to_harness_err)?;
+        if !existing.is_empty() {
+            return Ok(());
+        }
+        self.append_provisioned(ProvisionedEntry {
+            id: self.session.id_generator().next(),
+            kind: ProvisionedKind::ThinkingLevel {
+                // The entry stores the wire name. Derive it from the enum's own
+                // serde representation (`#[serde(rename_all = "lowercase")]`) so
+                // this cannot drift from what a reader parses back.
+                thinking_level: serde_json::to_value(level)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "off".to_string()),
+            },
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Append a `model_change` / `thinking_level_change` / `active_tools_change`
+    /// entry for a **mid-session** state change.
+    ///
+    /// Mirrors pi: every `setModel` / `setThinkingLevel` / `setActiveTools`
+    /// lands on the session branch, so a reader of the file can reconstruct
+    /// which model and thinking level a turn actually ran with. rpi parsed and
+    /// rendered these entries but never wrote one.
+    ///
+    /// Skipped when the branch is still empty: a non-message entry as the sole
+    /// leaf breaks `fork` (`ForkOptions::Branch` requires a message leaf), the
+    /// same constraint that defers the startup `thinking_level_change` write to
+    /// the first turn.
+    async fn record_state_change(&self, kind: ProvisionedKind) -> HarnessResult<()> {
+        let any = self
+            .session
+            .find_entries_on_branch(
+                &EntryQuery {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .map_err(session_to_harness_err)?;
+        if any.is_empty() {
+            return Ok(());
+        }
+        self.append_provisioned(ProvisionedEntry {
+            id: self.session.id_generator().next(),
+            kind,
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Commit the frame-stream binding, assistant entry, and step attempt in
     /// one durable append. The logical order remains binding → entry → step.
     pub(crate) async fn append_bound_provisioned_with_step_attempt(
@@ -3922,6 +4002,19 @@ impl AgentHarness {
             harness: self,
             run_id: run_id.clone(),
         };
+
+        // Record the thinking level this session started at, before any prompt
+        // is persisted. pi writes `thinking_level_change` as session entry #2;
+        // rpi parsed and rendered those entries but never wrote one, so a session
+        // started with `--thinking low` was indistinguishable from a default one
+        // to every reader of the file.
+        //
+        // This runs at the first turn rather than at construction because a
+        // non-message entry as the sole leaf of an empty session breaks
+        // `fork` (`ForkOptions::Branch` requires a message leaf). Deferring to
+        // here keeps the entry out of the empty-lane window while still landing
+        // it before the first model call.
+        self.record_startup_thinking_level().await?;
 
         // `nextRun` messages are consumed when a new run starts, before the
         // caller's prompt. This matches pi's ordering and keeps them durable
@@ -5465,11 +5558,23 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_model(&self, model: Model) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed =
+                inner.model.id != model.id || inner.model.provider != model.provider;
+            inner.model = model.clone();
+            changed
+        };
+        if changed {
+            self.record_state_change(ProvisionedKind::ModelChange {
+                provider: model.provider.clone(),
+                model_id: model.id.clone(),
+            })
+            .await?;
         }
-        inner.model = model;
         Ok(())
     }
 
@@ -5482,11 +5587,26 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_thinking_level(&self, level: ThinkingLevel) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.thinking_level != level;
+            inner.thinking_level = level;
+            changed
+        };
+        if changed {
+            // The entry stores the wire name; derive it from the enum's own
+            // serde representation so this cannot drift from what a reader
+            // parses back (same rule as the startup write).
+            let thinking_level = serde_json::to_value(level)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "off".to_string());
+            self.record_state_change(ProvisionedKind::ThinkingLevel { thinking_level })
+                .await?;
         }
-        inner.thinking_level = level;
         Ok(())
     }
 
@@ -5499,11 +5619,21 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_active_tools(&self, names: Vec<String>) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.active_tool_names != names;
+            inner.active_tool_names = names.clone();
+            changed
+        };
+        if changed {
+            self.record_state_change(ProvisionedKind::ActiveTools {
+                active_tool_names: names,
+            })
+            .await?;
         }
-        inner.active_tool_names = names;
         Ok(())
     }
 
@@ -5831,11 +5961,26 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_model(&self, model: Model) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed =
+                inner.model.id != model.id || inner.model.provider != model.provider;
+            inner.model = model.clone();
+            changed
+        };
+        // Same durability rule as the main lane: the branch records what each
+        // turn actually ran with.
+        if changed {
+            self.runner()
+                .record_state_change(ProvisionedKind::ModelChange {
+                    provider: model.provider.clone(),
+                    model_id: model.id.clone(),
+                })
+                .await?;
         }
-        inner.model = model;
         Ok(())
     }
 
@@ -5848,11 +5993,24 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_thinking_level(&self, level: ThinkingLevel) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.thinking_level != level;
+            inner.thinking_level = level;
+            changed
+        };
+        if changed {
+            let thinking_level = serde_json::to_value(level)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "off".to_string());
+            self.runner()
+                .record_state_change(ProvisionedKind::ThinkingLevel { thinking_level })
+                .await?;
         }
-        inner.thinking_level = level;
         Ok(())
     }
 
@@ -5865,11 +6023,22 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_active_tools(&self, names: Vec<String>) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.active_tool_names != names;
+            inner.active_tool_names = names.clone();
+            changed
+        };
+        if changed {
+            self.runner()
+                .record_state_change(ProvisionedKind::ActiveTools {
+                    active_tool_names: names,
+                })
+                .await?;
         }
-        inner.active_tool_names = names;
         Ok(())
     }
 
