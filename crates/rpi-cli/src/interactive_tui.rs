@@ -1775,9 +1775,7 @@ pub async fn interactive_tui(
                 && !state_for_key.selector_open()
                 && !state_for_key.extension_dialog_open()
             {
-                if let Some(request) = ask_user_for_key
-                    .take_pending_excluding_reserved()
-                {
+                if let Some(request) = ask_user_for_key.take_pending_for_tui() {
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }

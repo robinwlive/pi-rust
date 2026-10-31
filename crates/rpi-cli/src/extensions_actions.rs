@@ -38,6 +38,47 @@
 //! held by `rpi-cli` at build time and moved into the host.
 
 use std::collections::BTreeMap;
+
+/// 合并「内建命令」与「扩展命令」成 `ListCommands` 的载荷。
+///
+/// 抽成纯函数是因为它是这套形状的**唯一**真相源：
+/// · 内建命令（`/help` `/clear` `/model` …）不在插件注册表里 —— 它们在 TUI 的
+///   `CommandRegistry`；只报扩展那半，远程客户端的补全列表会缺掉最常用的那批。
+/// · 内建优先（与 TUI 的 `build_builtin_registry()` +
+///   `register_extension_commands()` 同口径），同名的扩展命令被丢弃。
+/// · 扩展命令名可能不带前导 `/`，统一补上。
+fn merge_command_list(
+    builtin: Vec<(String, String)>,
+    extension: Vec<(String, String)>,
+) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for (name, description) in builtin {
+        if seen.insert(name.clone()) {
+            out.push(serde_json::json!({
+                "name": name,
+                "description": description,
+                "source": "builtin",
+            }));
+        }
+    }
+    for (name, description) in extension {
+        // 扩展命令名可能不带前导 `/`，统一补上（与 TUI 的规整一致）。
+        let name = if name.starts_with('/') {
+            name
+        } else {
+            format!("/{name}")
+        };
+        if seen.insert(name.clone()) {
+            out.push(serde_json::json!({
+                "name": name,
+                "description": description,
+                "source": "extension",
+            }));
+        }
+    }
+    out
+}
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -128,12 +169,20 @@ impl HarnessActionHost {
 
     /// Publish the loaded extension registry so `ListCommands` can answer.
     ///
-    /// Called once after extension discovery (and again after a successful
-    /// `/reload`, which swaps in a fresh snapshot).
+    /// Called once after extension discovery; `/reload` re-publishes through
+    /// [`RuntimeActionHost::publish_registry`](rpi_extensions::RuntimeActionHost::publish_registry).
     pub fn set_registry(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
         if let Ok(mut g) = self.registry.write() {
             *g = Some(snapshot);
         }
+    }
+
+    /// `RuntimeActionHost::publish_registry` 的实现 —— 让 `/reload` 也能更新它。
+    ///
+    /// 与 [`set_registry`](Self::set_registry) 是同一个动作，分开只是因为
+    /// trait 方法需要 `&dyn` 对象调用（`/reload` 手里只有 trait 对象）。
+    fn publish_registry_impl(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
+        self.set_registry(snapshot);
     }
 
     /// Read the published registry, if any.
@@ -528,6 +577,12 @@ impl RuntimeActionHost for HarnessActionHost {
         Ok(serde_json::json!({"requested": true}))
     }
 
+    /// `/reload` 换了新快照后把它发布进来，否则远程 UI 的命令补全会一直
+    /// 停留在启动时的那一套（新增扩展命令要重启 rpi 才能看到）。
+    fn publish_registry(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
+        self.publish_registry_impl(snapshot);
+    }
+
     /// `ListCommands` — enumerate registered slash commands.
     ///
     /// Shape matches the RPC mode's `rpc_get_commands` so both transports
@@ -539,42 +594,18 @@ impl RuntimeActionHost for HarnessActionHost {
         &self,
         _args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // 内建命令（/help /clear /model …）**不在插件注册表里** ——
-        // 它们在 TUI 的 `CommandRegistry`。只报扩展那半的话，远程客户端的
-        // 补全列表会缺掉最常用的那批，用户以为「rpi 没有命令」。
-        //
-        // 两半合并、内建优先（与 TUI 的 `build_builtin_registry()` +
-        // `register_extension_commands()` 同口径），并按名字去重。
-        let mut seen = std::collections::BTreeSet::new();
-        let mut out: Vec<serde_json::Value> = Vec::new();
-
-        for entry in crate::interactive_tui::build_builtin_commands_for_abi() {
-            if seen.insert(entry.0.clone()) {
-                out.push(serde_json::json!({
-                    "name": entry.0,
-                    "description": entry.1,
-                    "source": "builtin",
-                }));
-            }
-        }
-        if let Some(snap) = self.registry_snapshot() {
-            for c in snap.commands() {
-                // 扩展命令名可能不带前导 `/`，统一补上（与 TUI 的规整一致）。
-                let name = if c.name.starts_with('/') {
-                    c.name.clone()
-                } else {
-                    format!("/{}", c.name)
-                };
-                if seen.insert(name.clone()) {
-                    out.push(serde_json::json!({
-                        "name": name,
-                        "description": c.description,
-                        "source": "extension",
-                    }));
-                }
-            }
-        }
-        Ok(serde_json::json!({ "commands": out }))
+        let builtin = crate::interactive_tui::build_builtin_commands_for_abi();
+        let snapshot = self.registry_snapshot();
+        let extension: Vec<(String, String)> = snapshot
+            .as_deref()
+            .map(|s| {
+                s.commands()
+                    .iter()
+                    .map(|c| (c.name.clone(), c.description.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(serde_json::json!({ "commands": merge_command_list(builtin, extension) }))
     }
 
     async fn get_execution_context(
@@ -901,6 +932,52 @@ impl RuntimeActionHost for HarnessActionHost {
 
 #[cfg(test)]
 mod lifetime_tests;
+
+/// `ListCommands` 的合并口径：内建优先、同名去重、扩展名补前导 `/`。
+///
+/// 这些断言就是远程 UI 补全列表的契约 —— 只看「是不是空」不够，
+/// 去重与 `source` 都会影响前端的判定（扩展命令会显示「已派发」）。
+#[cfg(test)]
+mod list_commands_tests {
+    use super::merge_command_list;
+
+    fn names(v: &[serde_json::Value]) -> Vec<&str> {
+        v.iter().map(|c| c["name"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn builtin_wins_over_a_same_named_extension_command() {
+        let out = merge_command_list(
+            vec![("/model".into(), "内建的".into())],
+            vec![("/model".into(), "扩展的".into())],
+        );
+        assert_eq!(names(&out), vec!["/model"]);
+        assert_eq!(out[0]["source"], "builtin", "内建优先，不能被扩展覆盖");
+        assert_eq!(out[0]["description"], "内建的");
+    }
+
+    #[test]
+    fn extension_names_get_a_leading_slash() {
+        let out = merge_command_list(vec![], vec![("deploy".into(), "部署".into())]);
+        assert_eq!(names(&out), vec!["/deploy"], "补全列表里的命令都带 `/`");
+        assert_eq!(out[0]["source"], "extension");
+    }
+
+    #[test]
+    fn both_halves_are_present_and_ordered_builtin_first() {
+        let out = merge_command_list(
+            vec![("/help".into(), "帮助".into()), ("/clear".into(), "清屏".into())],
+            vec![("/deploy".into(), "部署".into())],
+        );
+        assert_eq!(names(&out), vec!["/help", "/clear", "/deploy"]);
+    }
+
+    #[test]
+    fn no_commands_is_an_empty_list_not_an_error() {
+        // 「没注册任何命令」是真实答案，客户端据此降级成「没有补全」。
+        assert!(merge_command_list(vec![], vec![]).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod send_user_message_tests {

@@ -548,8 +548,8 @@ impl AskUserBridge {
     /// loop calls this while no other dialog is open, so the visible-id
     /// bookkeeping is race-free without a separate lock.
     ///
-    /// ��过插件保留项（`pidingo:` 前缀）—— 那些归 Dash 的闸消费。
-    pub(super) fn take_pending_excluding_reserved(&self) -> Option<rpi_extensions::UiDialogRequest> {
+    /// 跳过插件保留项（`pidingo:` 前缀）—— 那些归 Dash 的闸消费。
+    pub(super) fn take_pending_for_tui(&self) -> Option<rpi_extensions::UiDialogRequest> {
         let mut visible = self.visible.lock().ok()?;
         if visible.is_some() {
             return None;
@@ -559,15 +559,6 @@ impl AskUserBridge {
             .take_pending_filtered(|r| !self.mailbox.is_reserved(&r.request_id))?;
         *visible = Some(request.request_id.clone());
         Some(request)
-    }
-
-    /// 兼容别名：与 `take_pending_excluding_reserved` 同义。
-    ///
-    /// 保留它是因为既有测试用例都用这个名字；而且"取一条给 TUI 显示的请求"
-    /// 本来就该跳过插件保留项 —— 用两个不同的名字做同一件事只会让人选错。
-    #[allow(dead_code)]
-    pub(super) fn take_pending(&self) -> Option<rpi_extensions::UiDialogRequest> {
-        self.take_pending_excluding_reserved()
     }
 
     pub(super) fn clear_visible(&self, id: &str) {

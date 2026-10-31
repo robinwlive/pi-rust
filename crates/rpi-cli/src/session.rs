@@ -433,7 +433,8 @@ pub fn prepare_extensions(
     // commands. Without this a remote client's `/` completion always came back
     // empty, and it could not tell that apart from "no host attached".
     // Done here (not at host construction): the registry is only known after
-    // extensions load, and a `/reload` rebuilds the host with a fresh one.
+    // extensions load. `/reload` publishes the new snapshot via
+    // `RuntimeActionHost::publish_registry`.
     if let Some(snapshot) = extension_session.snapshot_arc() {
         action_host.set_registry(snapshot);
     }
@@ -1481,6 +1482,9 @@ where
         ctx.ext_status.clone(),
         ctx.editor_text.clone(),
     );
+    // `host` 已 move 进 bridge；发布新快照时从 bridge 取回（`clone_host()` 只是
+    // 克隆那个 `Arc`，不新建 host）。
+    let host_for_registry = fresh_bridge.clone_host();
 
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
@@ -1500,6 +1504,13 @@ where
             eprintln!("reload: {s}");
         }
         report_deferred_renderers(&extension_session);
+    }
+    // 新快照发布给 action host，否则 `ListCommands` 会一直回启动时那一套：
+    // 远程 UI 的命令补全看不到 `/reload` 新加载的扩展命令（要重启才有）。
+    //
+    // 走 trait 方法而不是具体类型：这里手上只有 `Arc<dyn RuntimeActionHost>`。
+    if let Some(snapshot) = extension_session.snapshot_arc() {
+        host_for_registry.publish_registry(snapshot);
     }
 
     let has_package_providers = |session: &ExtensionSession| {
