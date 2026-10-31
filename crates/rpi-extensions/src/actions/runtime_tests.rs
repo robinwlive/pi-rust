@@ -139,11 +139,11 @@ async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
 
     // One past the new ceiling is still rejected as an unknown id.
-    // ⚠️ 用 `ListCommands`（当前最大编号）而不是 `Abort`：加了新动作之后，
+    // ⚠️ 用 `StopRound`（当前最大编号）而不是 `Abort`：加了新动作之后，
     // `Abort + 1` 就是合法编号了，这条会假失败。
     let mut rejected = StbString::empty();
     let rc = trampoline_runtime_action(
-        u32::from(RuntimeActionId::ListCommands) + 1,
+        u32::from(RuntimeActionId::StopRound) + 1,
         StbStringRef::from_str("{}"),
         &mut rejected,
         plugin.user_data(),

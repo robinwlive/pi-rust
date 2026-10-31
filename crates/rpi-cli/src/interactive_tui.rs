@@ -1757,10 +1757,24 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
-            if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
-                // ⚠️ 跳过插件保留的请求（`pidingo:` 前缀）：那些是给 Dash 的闸
-                // 消费的，TUI 抢走就会“弹在 tmux 里、Dash 界面上看不到”
-                // （用户就在 Dash 里，等于问题丢了）。
+            // 插件 `ask_user` 弹窗：**有外部桥时完全不碰**。
+            //
+            // 交互式 TUI 与插件抢同一个 `UiDialogMailbox`。以前 TUI 无条件取走
+            // 并画到终端里，于是任何**第三方扩展**发起的询问都会弹在 tmux 里，
+            // 而用户在看 Dash —— 问题等于丢了。`pidingo:` 前缀只能救我们自己
+            // 注册的工具（见 `PLUGIN_RESERVED_PREFIX`），救不了别人的。
+            //
+            // 判据用 `PI_DINGO_BRIDGE=on`（Dash spawn 时注入，见
+            // `crates/core/src/spawn.rs`）：它代表"这条会话有一个远程 UI 挂着"。
+            // 有它时整个信箱归桥（桥会把请求转发给 Dash 并等回答），
+            // 没有它（用户手敲 rpi）时保持原行为 —— 终端里弹窗。
+            //
+            // ⚠️ 不能用"有没有 `pidingo:` 前缀"来判：那只能挡住我们自己的请求。
+            let external_ui = std::env::var("PI_DINGO_BRIDGE").as_deref() == Ok("on");
+            if !external_ui
+                && !state_for_key.selector_open()
+                && !state_for_key.extension_dialog_open()
+            {
                 if let Some(request) = ask_user_for_key
                     .take_pending_excluding_reserved()
                 {

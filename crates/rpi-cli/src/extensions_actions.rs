@@ -518,6 +518,16 @@ impl RuntimeActionHost for HarnessActionHost {
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    /// `StopRound` — 跑完这一轮就停（温和版中止）。
+    ///
+    /// 与 `Abort` 的区别：Abort 立刻掐断正在流的输出与正在跑的工具；
+    /// 这里是让当前这一轮自然跑完，只是不再开下一轮。用户说「这轮做完先别继续」
+    /// 要的就是后者 —— 拿 Abort 顶替会把已经生成一半的答案截掉。
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.harness()?.request_stop_round();
+        Ok(serde_json::json!({"requested": true}))
+    }
+
     /// `ListCommands` — enumerate registered slash commands.
     ///
     /// Shape matches the RPC mode's `rpc_get_commands` so both transports

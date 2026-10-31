@@ -190,6 +190,34 @@ impl UiDialogMailbox {
         None
     }
 
+    /// 取走**所有未被插件保留**的请求（`RelayUiDialog` 的 take）。
+    ///
+    /// 给"远程 UI 全权接管"用：有外部客户端挂着时，第三方扩展发起的询问
+    /// 不该弹在终端里，而应转发给那个客户端。保留前缀的仍留给插件自己。
+    ///
+    /// 被取走的请求**从队列里移除**，但 `active` 里仍保留，
+    /// 所以后续 `respond` / `cancel`（按同一个 requestId）照常生效。
+    pub fn take_all_unreserved(&self) -> Vec<UiDialogRequest> {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        let mut keep: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut out: Vec<UiDialogRequest> = Vec::new();
+        while let Some(request_id) = state.pending.pop_front() {
+            let Some(entry) = state.active.get(&request_id) else {
+                continue;
+            };
+            if entry.cancelled || entry.answer.is_some() {
+                continue;
+            }
+            if self.is_reserved(&request_id) {
+                keep.push_back(request_id);
+            } else {
+                out.push(entry.request.clone());
+            }
+        }
+        state.pending = keep;
+        out
+    }
+
     /// `requestId` 是不是插件保留的（TUI 不该消费）。
     pub fn is_reserved(&self, request_id: &str) -> bool {
         request_id.starts_with(PLUGIN_RESERVED_PREFIX)
@@ -523,6 +551,14 @@ pub trait RuntimeActionHost: Send + Sync {
     /// accidentally report a fabricated user answer.
     async fn ui_dialog(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("ask_user requires an interactive UI".to_string())
+    }
+
+    /// `StopRound` — finish the current turn, then stop (gentle abort).
+    ///
+    /// Hosts that cannot honor it return an error; the caller then decides
+    /// whether to fall back to `Abort`. Default: not supported.
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("this host cannot stop after the current turn".to_string())
     }
 
     /// `ListCommands` — enumerate registered slash commands.
@@ -987,6 +1023,34 @@ async fn dispatch(
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::ListCommands => host.list_commands(args).await,
+        // 远程 UI 全权接管 `UiDialog`：有外部客户端挂着时，第三方扩展的询问
+        // 不该弹在终端里。`take` 取走全部非保留项，`respond`/`cancel` 用同一
+        // 套 requestId 收回答案（与 `UiDialog` 的语义一致）。
+        //
+        // ⚠️ 这条**只在有外部 UI 时**才该被调用；没有客户端时调用方应当
+        // 让 TUI 自己弹窗（否则问题就没人显示了）。判定在调用方（桥）那边。
+        RuntimeActionId::StopRound => host.stop_round(args),
+        RuntimeActionId::RelayUiDialog => {
+            let op = args.get("op").and_then(serde_json::Value::as_str).unwrap_or("take");
+            match op {
+                "take" => {
+                    let reqs: Vec<serde_json::Value> = ui_dialog
+                        .take_all_unreserved()
+                        .into_iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "requestId": r.request_id,
+                                "toolCallId": r.tool_call_id,
+                                "ui": r.ui,
+                            })
+                        })
+                        .collect();
+                    Ok(serde_json::json!({ "requests": reqs }))
+                }
+                "respond" | "cancel" => ui_dialog.handle(args),
+                other => Err(format!("RelayUiDialog 不认的 op：{other}")),
+            }
+        }
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
@@ -1029,8 +1093,9 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            // (26 = Abort, 27 = ListCommands; keep in sync with the enum.)
-            u32::from(RuntimeActionId::ListCommands),
+            // (26 = Abort, 27 = ListCommands, 28 = RelayUiDialog,
+            //  29 = StopRound; keep in sync with the enum.)
+            u32::from(RuntimeActionId::StopRound),
             args_json,
             out,
             user_data,
@@ -2041,6 +2106,54 @@ mod tests {
         assert!(mailbox.take_pending().is_none());
     }
 
+    /// `RelayUiDialog` 的 take 只取**非保留**项：第三方扩展的询问归远程 UI，
+    /// 带 `pidingo:` 的仍留给插件自己。这条保证「不抢别人的、也不丢自己的」。
+    #[test]
+    fn relay_take_returns_unreserved_and_keeps_reserved() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "third-party", "ui": {"kind": "input"}
+            }))
+            .unwrap();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "pidingo:ours", "ui": {"kind": "input"}
+            }))
+            .unwrap();
+
+        let taken = mailbox.take_all_unreserved();
+        assert_eq!(taken.len(), 1, "只该取走第三方那条");
+        assert_eq!(taken[0].request_id, "third-party");
+        // 保留项必须还在队列里，否则插件永远等不到自己的答案。
+        assert_eq!(mailbox.pending_len(), 1, "保留项不能被顺手取走");
+    }
+
+    /// `StopRound` 的默认实现必须**报不支持**（而不是假装成功）——
+    /// 否则调用方会以为「温和中止」生效了，实际什么都没发生。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_round_defaults_to_unsupported() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let user_data = bridge.user_data();
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            29,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(rc, 1, "不支持时必须回错误码，不能报成功");
+    }
+
     /// `ListCommands = 27` 必须走 trampoline 分发到宿主方法；默认实现回**空列表**
     /// 而不是报错 —— 客户端要能区分「没注册任何命令」与「宿主不支持这个动作」。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2115,12 +2228,12 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 28 is one past the highest defined action (`ListCommands = 27`).
+        // 30 is one past the highest defined action (`StopRound = 29`).
         // ⚠️ 这里的数字要跟着枚举走：加了新动作之后原来的 27 就合法了，
         // 写死旧数字会让这条假失败（本轮加 ListCommands 时就踩了一次）。
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(28, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(30, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.

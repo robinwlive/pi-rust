@@ -1163,6 +1163,30 @@ pub enum RuntimeActionId {
     /// an error: "none registered" is a real answer, and a client should
     /// degrade to "no completion available" instead of surfacing a failure.
     ListCommands = 27,
+    /// Relay host UI-dialog requests to an external UI.
+    ///
+    /// Args: `{"op":"take"}` — take every request the host has **not** reserved
+    /// for a plugin (i.e. requests raised by extensions that do not use the
+    /// `pidingo:` prefix), removing them from the mailbox. Result:
+    /// `{"requests":[{"requestId","toolCallId","ui"}]}` (possibly empty).
+    ///
+    /// `{"op":"respond","requestId":"…","answer":…}` and
+    /// `{"op":"cancel","requestId":"…"}` behave like the corresponding
+    /// `UiDialog` ops.
+    ///
+    /// Exists because the TUI and plugins share one mailbox: without a relay,
+    /// a third-party extension's question pops up on the terminal while the
+    /// real user is watching a remote client, and is effectively lost.
+    RelayUiDialog = 28,
+    /// Finish the current turn, then stop — the gentle counterpart of `Abort`.
+    ///
+    /// `Abort` interrupts the in-flight provider call and running tools; this
+    /// only prevents the loop from starting another turn, so the current answer
+    /// is not truncated. Args: `{}`; result: `{"requested": true}`.
+    ///
+    /// Setting it while idle is a harmless no-op: the flag is one-shot and is
+    /// cleared when the next run starts.
+    StopRound = 29,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1211,6 +1235,8 @@ impl TryFrom<u32> for RuntimeActionId {
             25 => Ok(Self::SideQuestion),
             26 => Ok(Self::Abort),
             27 => Ok(Self::ListCommands),
+            28 => Ok(Self::RelayUiDialog),
+            29 => Ok(Self::StopRound),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
