@@ -74,9 +74,6 @@ async fn expired_reverse_bindings_fail_closed_but_still_reclaim_their_children()
         .is_err());
 }
 
-/// A plugin's stop button must be idempotent: aborting an idle lane returns the
-/// documented no-op result instead of surfacing `NoActiveRun` as an action
-/// error. Aborting a lane that IS running reports the cancelled run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_is_a_noop_when_idle_and_reports_the_run_it_cancelled() {
     let (host, cell) = HarnessActionHost::new_empty(
@@ -140,10 +137,6 @@ async fn abort_is_a_noop_when_idle_and_reports_the_run_it_cancelled() {
     );
 }
 
-/// End-to-end: the images a plugin attaches actually reach the transcript as
-/// image content blocks (not just "the args parsed"). This is the assertion the
-/// unit tests above cannot make — `prompt_text`'s `images` argument, not our
-/// parsing, decides the stored shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_user_message_stores_attached_images_in_the_transcript() {
     use base64::Engine as _;
@@ -222,133 +215,7 @@ async fn send_user_message_stores_attached_images_in_the_transcript() {
     assert_eq!(images[0].mime_type, "image/png");
     assert_eq!(images[0].data, png);
 }
-    let (host, cell) = HarnessActionHost::new_empty(
-        vec![],
-        std::env::temp_dir(),
-        Handle::current(),
-        BTreeMap::new(),
-        rpi_extensions::ToolCallContext::default(),
-    );
-<<<<<<< HEAD
-    let provider = FauxProvider::new(
-        FauxScript::new()
-            .with_text("a slow answer")
-            .with_tokens_per_second(1.0),
-    );
-=======
-    let provider = FauxProvider::new(FauxScript::new().with_text("got it"));
->>>>>>> 3a55693 (feat(plugin-sdk): allow images in SendUserMessage)
-    let harness = AgentHarness::create(AgentHarnessOptions {
-        model: provider.default_model().clone(),
-        models: vec![provider],
-        ..Default::default()
-    })
-    .await
-    .unwrap();
-    HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
 
-<<<<<<< HEAD
-    // Idle: no run is in progress, so the stop button is a no-op, not an error.
-    assert_eq!(
-        host.abort(json!({})).await.unwrap(),
-        json!({ "aborted": false })
-    );
-
-    // Active: the same action cancels the in-flight run and names it.
-    let lane = harness.lane("main");
-    let running = tokio::spawn({
-        let lane = lane.clone();
-        async move { lane.prompt_text("go", Vec::new()).await }
-    });
-    let aborted = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let value = host.abort(json!({})).await.unwrap();
-            if value["aborted"] == json!(true) {
-                break value;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("abort must observe the active run");
-    assert!(
-        aborted["runId"].as_str().is_some_and(|id| !id.is_empty()),
-        "{aborted}"
-    );
-    let outcome = running.await.unwrap().unwrap();
-    assert!(
-        matches!(outcome.outcome, HarnessRunOutcome::Aborted { .. }),
-        "{:?}",
-        outcome.outcome
-    );
-    // Settled again: back to the idempotent no-op.
-    assert_eq!(
-        host.abort(json!({})).await.unwrap(),
-        json!({ "aborted": false })
-    );
-=======
-    let png = base64::engine::general_purpose::STANDARD.encode([
-        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ]);
-
-    // Pure-image send (no `text` at all) plus one unusable entry, which must be
-    // skipped rather than failing the whole message.
-    let result = host
-        .send_user_message(json!({
-            "images": [
-                {"mediaType":"image/png","data": png},
-                {"mediaType":"image/png","data": "not-base64!!"},
-            ]
-        }))
-        .await
-        .unwrap();
-    assert_eq!(result["images"], 1);
-    assert_eq!(result["skippedImages"], 1);
-
-    let log = harness
-        .session()
-        .get_log(&rpi_harness::session::types::LogOptions {
-            after_seq: None,
-            limit: None,
-        })
-        .await
-        .unwrap();
-    let user_message = log
-        .iter()
-        .find_map(|item| match item {
-            rpi_harness::session::types::LogItem::Entry {
-                entry: rpi_harness::session::types::Entry::Message(entry),
-                ..
-            } => match &entry.message {
-                rpi_agent::AgentMessage::User(user) => Some(user),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("the user message must be in the transcript");
-    let images: Vec<_> = match &user_message.content {
-        rpi_ai::types::UserContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                rpi_ai::types::Content::Image(image) => Some(image),
-                _ => None,
-            })
-            .collect(),
-        rpi_ai::types::UserContent::Text(_) => vec![],
-    };
-    assert_eq!(images.len(), 1, "exactly the valid image is stored");
-    assert_eq!(images[0].mime_type, "image/png");
-    assert_eq!(images[0].data, png);
->>>>>>> 3a55693 (feat(plugin-sdk): allow images in SendUserMessage)
-}
-
-/// `SendMessage` is the other entry point into the same harness path, so it had
-/// the same image gap as `SendUserMessage`: `{"text", "images"}` silently sent
-/// text only. This pins both the reported counts and the stored shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_message_stores_attached_images_in_the_transcript() {
     use base64::Engine as _;
