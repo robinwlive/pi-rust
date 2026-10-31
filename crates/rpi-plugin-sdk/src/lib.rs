@@ -2200,6 +2200,9 @@ mod tests {
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
             RuntimeActionId::Abort,
+            RuntimeActionId::ListCommands,
+            RuntimeActionId::RelayUiDialog,
+            RuntimeActionId::StopRound,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -2209,8 +2212,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(27),
-            Err(UnknownRuntimeActionId(27))
+            RuntimeActionId::try_from(30),
+            Err(UnknownRuntimeActionId(30))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
