@@ -848,9 +848,14 @@ fn install_native_package_at_with_hook(
     let mut asset_targets = Vec::with_capacity(assets.len());
     for asset in assets {
         let target = checked_asset_target(destination, &asset.path)?;
-        let owned = previous_assets
-            .iter()
-            .any(|old| old.eq_ignore_ascii_case(&asset.path));
+        // Same identity rule as the transaction and the stale check. A case-folded name is
+        // owned only when it is the recorded file itself (a case-insensitive store), never a
+        // different file that merely differs in case.
+        let owned = previous_assets.iter().any(|old| {
+            native_artifact_identity(old) == native_artifact_identity(&asset.path)
+                || (old.eq_ignore_ascii_case(&asset.path)
+                    && same_file(&destination.join(old), &target))
+        });
         if !force && !owned {
             match std::fs::symlink_metadata(&target) {
                 Ok(_) => {
@@ -872,9 +877,12 @@ fn install_native_package_at_with_hook(
     }
     let mut stale_asset_targets = Vec::new();
     for old in &previous_assets {
-        // Exact match: on a case-sensitive store a case-only rename is a different file,
-        // and leaving the old one would orphan it. Windows lowercases identities in the transaction.
-        if !assets.iter().any(|asset| asset.path == *old) {
+        // On a case-sensitive store a case-only rename is a different file, and leaving
+        // the old one would orphan it. Windows folds identities, as the transaction does.
+        if !assets
+            .iter()
+            .any(|asset| native_artifact_identity(&asset.path) == native_artifact_identity(old))
+        {
             stale_asset_targets.push(checked_asset_target(destination, old)?);
         }
     }
@@ -1088,6 +1096,25 @@ fn native_artifact_identity(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Whether two paths name the same existing file (one inode). Windows already folds case
+/// in `native_artifact_identity`, so only Unix needs the inode check.
+#[cfg(unix)]
+fn same_file(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::symlink_metadata(left),
+        std::fs::symlink_metadata(right),
+    ) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(_: &Path, _: &Path) -> bool {
+    false
 }
 
 fn transaction_path_identity(path: &Path) -> String {
@@ -2574,6 +2601,65 @@ mod tests {
                 .sum()
         }
         assert_eq!(store_files(&destination), 2);
+    }
+
+    #[test]
+    fn native_asset_case_variant_of_an_owned_sidecar_is_not_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library").unwrap();
+        let first = [("Runtime/main.mjs", &b"worker v1"[..])];
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &first),
+            std::slice::from_ref(&library),
+            &sidecars(&first),
+            false,
+        )
+        .unwrap();
+        std::fs::create_dir_all(destination.join("runtime")).unwrap();
+        std::fs::write(destination.join("runtime/main.mjs"), b"user file").unwrap();
+        if std::fs::read(destination.join("Runtime/main.mjs")).unwrap() == b"user file" {
+            return; // case-insensitive store: the two names are one file, nothing to test
+        }
+
+        let second = [("runtime/main.mjs", &b"worker v2"[..])];
+        let error = install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("--force"), "{error}");
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"user file"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("Runtime/main.mjs")).unwrap(),
+            b"worker v1"
+        );
+
+        install_native_package_with_assets_at(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.1.0", &second),
+            std::slice::from_ref(&library),
+            &sidecars(&second),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("runtime/main.mjs")).unwrap(),
+            b"worker v2"
+        );
+        assert!(!destination.join("Runtime").exists());
     }
 
     #[test]
