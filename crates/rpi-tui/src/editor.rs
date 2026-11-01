@@ -851,6 +851,11 @@ impl Editor {
             .unwrap_or((0, 0))
     }
 
+    /// Number of logical lines in the draft (always at least 1).
+    pub fn line_count(&self) -> usize {
+        self.state.lock().map(|s| s.lines.len()).unwrap_or(1).max(1)
+    }
+
     /// Set the cursor position (clamped to text bounds), clearing any
     /// in-progress selection. Used by autocomplete to place the caret after
     /// accepting a suggestion (`set_text` resets the caret to the start).
