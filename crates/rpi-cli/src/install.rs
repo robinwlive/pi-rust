@@ -931,20 +931,33 @@ fn install_native_package_at_with_hook(
         staged: stage_native_bytes(&registry, metadata_path)?,
         target: metadata_path.to_path_buf(),
     });
+    // Directories this transaction creates, so a failed install can remove them again.
+    let mut created_dirs = Vec::new();
     for target in &asset_targets {
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!(
+            created_dirs.extend(
+                parent
+                    .ancestors()
+                    .take_while(|dir| *dir != destination && !dir.exists())
+                    .map(Path::to_path_buf),
+            );
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                remove_created_dirs(&mut created_dirs);
+                return Err(format!(
                     "could not create extension directory {}: {error}",
                     parent.display()
-                )
-            })?;
+                ));
+            }
         }
     }
 
     let mut removals = stale_targets;
     removals.extend(stale_asset_targets.iter().cloned());
-    activate_native_transaction(&replacements, &removals, &mut before_activate)?;
+    if let Err(error) = activate_native_transaction(&replacements, &removals, &mut before_activate)
+    {
+        remove_created_dirs(&mut created_dirs);
+        return Err(error);
+    }
     prune_empty_dirs(destination, &stale_asset_targets);
     Ok(installed_targets.into_iter().chain(asset_targets).collect())
 }
@@ -1056,6 +1069,15 @@ fn write_staged_asset(bytes: &[u8], path: &Path) -> Result<(), String> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write staged asset {}: {error}", path.display()))
+}
+
+/// Remove directories a failed transaction created, deepest first. A directory that is
+/// not empty (for example after a failed rollback) is kept.
+fn remove_created_dirs(dirs: &mut [PathBuf]) {
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in dirs.iter() {
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 /// Remove directories left empty by removed sidecars. The store itself is kept.
@@ -2660,6 +2682,43 @@ mod tests {
             b"worker v2"
         );
         assert!(!destination.join("Runtime").exists());
+    }
+
+    #[test]
+    fn native_asset_failed_first_install_removes_the_directories_it_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let library = temp.path().join("libdemo.so");
+        std::fs::write(&library, b"library").unwrap();
+        std::fs::create_dir_all(destination.join("keep")).unwrap();
+        let assets = [("runtime/deep/x.mjs", &b"x"[..]), ("keep/y.mjs", &b"y"[..])];
+        // Replacements activate in order: library, x.mjs, y.mjs, registry.
+        let error = install_native_package_at_with_hook(
+            &destination,
+            &metadata,
+            prebuilt_record("demo", "1.0.0", &assets),
+            std::slice::from_ref(&library),
+            &sidecars(&assets),
+            false,
+            |index, _| {
+                if index == 2 {
+                    Err("injected sidecar activation failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected"), "{error}");
+        assert!(!destination.join("runtime").exists());
+        // A directory that existed before the install is left alone, even though it is empty.
+        assert!(destination.join("keep").is_dir());
+        assert!(!destination.join("libdemo.so").exists());
+        assert!(!metadata.exists());
+        assert_no_native_transaction_files(temp.path());
+        assert_no_native_transaction_files(&destination);
     }
 
     #[test]
