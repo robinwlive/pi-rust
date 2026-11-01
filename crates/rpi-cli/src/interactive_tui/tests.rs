@@ -2449,8 +2449,317 @@ fn provider_oauth_escape_cancels_the_in_flight_call() {
     assert!(!exchange_cancel.is_cancelled());
     finish_provider_login(&state, &editor_container, &editor, &tui);
     assert!(exchange_cancel.is_cancelled());
-    // After the flow ends, a stray submit gets an already-cancelled token.
-    assert!(state.provider_auth_token().is_cancelled());
+    // After the flow ends, a stray submit gets an already-cancelled token, and
+    // so does one from that flow after a newer flow began.
+    assert!(state.provider_auth_token(flow_id).is_cancelled());
+    let (newer, newer_cancel) = state.begin_provider_auth();
+    assert!(state.provider_auth_token(flow_id).is_cancelled());
+    assert!(!state.provider_auth_token(newer).is_cancelled());
+    assert!(!newer_cancel.is_cancelled());
+}
+
+/// Esc during logout initialization: one Esc lands after the flow began but
+/// before its status screen showed, which sends no revoke and leaves the editor
+/// usable; one lands on the status screen, which cancels the queued revoke so a
+/// late success for that flow leaves the stored credential alone.
+#[test]
+fn escape_during_logout_initialization_never_revokes_or_sticks() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        crate::config::upsert_oauth_token("acme", "kept".into(), "kept".into(), 0).unwrap();
+        let logout = || {
+            begin_provider_oauth_logout(
+                &state,
+                &editor_container,
+                &editor,
+                &tui,
+                &tx,
+                "acme",
+                "kept".into(),
+                "kept".into(),
+            )
+        };
+
+        // Esc between the flow start and the status screen.
+        let escape_won = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        settings::AFTER_PROVIDER_FLOW_BEGIN.with(|hook| {
+            let (state, editor_container, editor, tui, escape_won) = (
+                state.clone(),
+                editor_container.clone(),
+                editor.clone(),
+                tui.clone(),
+                escape_won.clone(),
+            );
+            hook.set(Some(Box::new(move || {
+                let won = finish_provider_login(&state, &editor_container, &editor, &tui);
+                escape_won.store(won, std::sync::atomic::Ordering::SeqCst);
+            })))
+        });
+        logout();
+        assert!(
+            escape_won.load(std::sync::atomic::Ordering::SeqCst),
+            "the flow was not live when Esc landed"
+        );
+        assert!(rx.try_recv().is_err(), "a cancelled logout sent a revoke");
+        assert!(editor.is_focused(), "the status screen covered the editor");
+        assert_eq!(
+            state
+                .provider_auth_flow_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // Esc on the status screen, before the revoke is dispatched.
+        logout();
+        let Ok(TuiMessage::ProviderOAuthAction {
+            action,
+            purpose: ProviderOAuthPurpose::Logout,
+            flow_id,
+            cancel,
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("revoke was not sent");
+        };
+        assert_eq!(action, "revoke");
+        assert!(!cancel.is_cancelled());
+        assert!(finish_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui
+        ));
+        assert!(
+            cancel.is_cancelled(),
+            "the queued revoke must observe the cancel"
+        );
+        handle_provider_oauth_result(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            "acme",
+            "revoke",
+            Ok(serde_json::json!({"version": 1, "kind": "success", "payload": {}})),
+            ProviderOAuthPurpose::Logout,
+            flow_id,
+        );
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(rx.try_recv().is_err());
+    });
+}
+
+/// An Esc during logout initialization followed at once by a new login leaves
+/// that login running: the logout's late screen check neither cancels it nor
+/// sends a revoke.
+#[test]
+fn a_late_logout_screen_check_leaves_a_newer_flow_running() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    settings::AFTER_PROVIDER_FLOW_BEGIN.with(|hook| {
+        let (state, editor_container, editor, tui, tx) = (
+            state.clone(),
+            editor_container.clone(),
+            editor.clone(),
+            tui.clone(),
+            tx.clone(),
+        );
+        hook.set(Some(Box::new(move || {
+            assert!(finish_provider_login(
+                &state,
+                &editor_container,
+                &editor,
+                &tui
+            ));
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+        })))
+    });
+    begin_provider_oauth_logout(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        "kept".into(),
+        "kept".into(),
+    );
+    let Ok(TuiMessage::ProviderOAuthAction {
+        action,
+        flow_id,
+        cancel,
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("the newer login's begin was not sent");
+    };
+    assert_eq!(action, "begin");
+    assert!(rx.try_recv().is_err(), "the cancelled logout sent a revoke");
+    assert!(!cancel.is_cancelled(), "the newer login was cancelled");
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        flow_id
+    );
+}
+
+/// A flow's id is published under the token lock, together with its token, so
+/// a reader holding that lock (as Esc does) never sees a flow without its token.
+#[test]
+fn provider_auth_flow_id_is_published_with_its_token() {
+    let state = test_tui_state();
+    let slot = state.provider_auth_cancel.lock().unwrap();
+    let begin = std::thread::spawn({
+        let state = state.clone();
+        move || state.begin_provider_auth()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the flow id was published before its token"
+    );
+    drop(slot);
+    let (flow_id, cancel) = begin.join().unwrap();
+    assert_eq!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        flow_id
+    );
+    assert!(state.end_provider_auth());
+    assert!(cancel.is_cancelled());
+}
+
+/// An interaction result whose flow Esc ended while the form was being shown
+/// leaves the editor usable instead of a form no Esc can dismiss.
+#[test]
+fn an_interaction_form_for_an_ended_flow_restores_the_editor() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction { flow_id, .. }) = rx.try_recv() else {
+        panic!("begin was not sent");
+    };
+    assert!(finish_provider_login(
+        &state,
+        &editor_container,
+        &editor,
+        &tui
+    ));
+    begin_provider_oauth_input(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        serde_json::json!({"display": {"title": "Authorize"}}),
+        flow_id,
+    );
+    assert!(state.active_provider_input.lock().unwrap().is_none());
+    assert!(editor.is_focused());
+    assert!(rx.try_recv().is_err());
+}
+
+/// A failed result that lost its flow to Esc, after which the user began a
+/// newer flow, neither ends that newer flow nor reports an error for it.
+#[test]
+fn a_stale_failed_result_leaves_a_newer_flow_running() {
+    let state = test_tui_state();
+    let editor_container = Arc::new(Container::new());
+    let editor = state.editor.clone();
+    editor_container.add_child(editor.clone());
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+    let Ok(TuiMessage::ProviderOAuthAction { flow_id: stale, .. }) = rx.try_recv() else {
+        panic!("begin was not sent");
+    };
+    let newer = Arc::new(std::sync::Mutex::new(None));
+    settings::BEFORE_PROVIDER_FLOW_CLAIM.with(|hook| {
+        let (state, editor_container, editor, tui, tx, newer) = (
+            state.clone(),
+            editor_container.clone(),
+            editor.clone(),
+            tui.clone(),
+            tx.clone(),
+            newer.clone(),
+        );
+        hook.set(Some(Box::new(move || {
+            finish_provider_login(&state, &editor_container, &editor, &tui);
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+            *newer.lock().unwrap() = Some(
+                state.provider_auth_token(
+                    state
+                        .provider_auth_flow_id
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+            );
+        })))
+    });
+    let messages_before = state.chat_container.child_count();
+    handle_provider_oauth_result(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        &tx,
+        "acme",
+        "begin",
+        Err("network down".to_string()),
+        ProviderOAuthPurpose::Login,
+        stale,
+    );
+    let newer = newer.lock().unwrap().take().expect("Esc did not land");
+    assert!(
+        !newer.is_cancelled(),
+        "the stale result cancelled the newer flow"
+    );
+    assert_ne!(
+        state
+            .provider_auth_flow_id
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(
+        state.chat_container.child_count(),
+        messages_before,
+        "the stale result reported an error"
+    );
 }
 
 /// Esc that lands after a result passed its flow check, but before the write,

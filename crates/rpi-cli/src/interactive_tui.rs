@@ -3431,6 +3431,14 @@ pub async fn interactive_tui(
                 flow_id,
                 cancel,
             }) => {
+                // The flow ended (Esc, or a newer flow) before its call started.
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
                 let (snapshot, keepalive) = {
                     let session = ctx
                         .reload_context
@@ -3510,31 +3518,16 @@ pub async fn interactive_tui(
                     Some(crate::config::Credential::Oauth {
                         access, refresh, ..
                     }) => {
-                        show_provider_auth_status(
+                        begin_provider_oauth_logout(
                             &state,
                             &editor_container,
                             &editor,
                             &tui,
-                            &format!("Revoking OAuth credentials for {provider}…"),
+                            &ctx.tx,
+                            &provider,
+                            access,
+                            refresh,
                         );
-                        let flow_id = state
-                            .provider_auth_generation
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                            .wrapping_add(1);
-                        state
-                            .provider_auth_flow_id
-                            .store(flow_id, std::sync::atomic::Ordering::Release);
-                        let cancel = state.begin_provider_auth();
-                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
-                            provider,
-                            action: "revoke".to_string(),
-                            input: serde_json::json!({
-                                "credential": {"access": access, "refresh": refresh}
-                            }),
-                            purpose: ProviderOAuthPurpose::Logout,
-                            flow_id,
-                            cancel,
-                        });
                     }
                     Some(crate::config::Credential::ApiKey { .. }) => {
                         match crate::config::delete_credential(&provider) {

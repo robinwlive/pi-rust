@@ -1468,27 +1468,40 @@ impl TuiState {
         cancellation
     }
 
-    /// Start the cancellation scope for a new provider OAuth flow. A previous
-    /// token is cancelled, so a call from an older flow cannot outlive it.
-    pub(super) fn begin_provider_auth(&self) -> CancellationToken {
+    /// Start a provider OAuth flow: allocate its id and publish the id and its
+    /// cancellation token in one step under the token lock, so an Esc that ends
+    /// the flow always finds the token to cancel. A previous flow's token is
+    /// cancelled, so a call from an older flow cannot outlive it.
+    pub(super) fn begin_provider_auth(&self) -> (u64, CancellationToken) {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let flow_id = self
+            .provider_auth_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
         let cancellation = CancellationToken::new();
-        if let Some(previous) = self
-            .provider_auth_cancel
-            .lock()
-            .unwrap()
-            .replace(cancellation.clone())
-        {
+        if let Some(previous) = slot.replace(cancellation.clone()) {
             previous.cancel();
         }
-        cancellation
+        self.provider_auth_flow_id
+            .store(flow_id, std::sync::atomic::Ordering::Release);
+        (flow_id, cancellation)
     }
 
-    /// The token for the active flow's next provider call. With no active flow
-    /// it is already cancelled, so a late submit cannot run unobserved.
-    pub(super) fn provider_auth_token(&self) -> CancellationToken {
-        match self.provider_auth_cancel.lock().unwrap().as_ref() {
-            Some(cancellation) => cancellation.clone(),
-            None => {
+    /// The token for flow `flow_id`'s next provider call. If that flow is no
+    /// longer active it is already cancelled, so a late submit cannot run
+    /// unobserved or borrow a newer flow's token.
+    pub(super) fn provider_auth_token(&self, flow_id: u64) -> CancellationToken {
+        let slot = self.provider_auth_cancel.lock().unwrap();
+        match slot.as_ref() {
+            Some(cancellation)
+                if self
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == flow_id =>
+            {
+                cancellation.clone()
+            }
+            _ => {
                 let cancellation = CancellationToken::new();
                 cancellation.cancel();
                 cancellation
@@ -1496,12 +1509,42 @@ impl TuiState {
         }
     }
 
-    /// End the active provider OAuth flow and cancel its call, if one is running.
-    pub(super) fn cancel_provider_auth(&self) {
-        let cancellation = self.provider_auth_cancel.lock().unwrap().take();
-        if let Some(cancellation) = cancellation {
+    /// End the active provider OAuth flow, if any, and cancel its call. Returns
+    /// whether a flow was active, i.e. this end won it from a completing result.
+    pub(super) fn end_provider_auth(&self) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let ended = self
+            .provider_auth_flow_id
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+            != 0;
+        if let Some(cancellation) = slot.take() {
             cancellation.cancel();
         }
+        ended
+    }
+
+    /// End flow `flow_id` only if it is still the active one, for a result
+    /// about to write the store. Exactly one of this and an Esc's
+    /// [`Self::end_provider_auth`] wins; a losing claim changes nothing.
+    pub(super) fn claim_provider_auth(&self, flow_id: u64) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let claimed = flow_id != 0
+            && self
+                .provider_auth_flow_id
+                .compare_exchange(
+                    flow_id,
+                    0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+        if claimed {
+            // The call already returned; this only clears the slot.
+            if let Some(cancellation) = slot.take() {
+                cancellation.cancel();
+            }
+        }
+        claimed
     }
 
     /// Clear the user-bash slot. Called when the command finishes so the

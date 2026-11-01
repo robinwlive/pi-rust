@@ -893,14 +893,7 @@ pub(super) fn begin_provider_oauth_login(
     tx: &mpsc::UnboundedSender<TuiMessage>,
     provider_id: &str,
 ) {
-    let flow_id = state
-        .provider_auth_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        .wrapping_add(1);
-    state
-        .provider_auth_flow_id
-        .store(flow_id, std::sync::atomic::Ordering::Release);
-    let cancel = state.begin_provider_auth();
+    let (flow_id, cancel) = state.begin_provider_auth();
     show_provider_auth_status(
         state,
         editor_container,
@@ -913,6 +906,46 @@ pub(super) fn begin_provider_oauth_login(
         action: "begin".to_string(),
         input: serde_json::json!({}),
         purpose: ProviderOAuthPurpose::Login,
+        flow_id,
+        cancel,
+    });
+}
+/// Start revoking a stored OAuth credential. The flow begins before its status
+/// screen shows, so an Esc on that screen always ends this flow and cancels the
+/// revoke it queued; an Esc before the screen shows sends no revoke at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_provider_oauth_logout(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider_id: &str,
+    access: String,
+    refresh: String,
+) {
+    let (flow_id, cancel) = state.begin_provider_auth();
+    #[cfg(test)]
+    if let Some(hook) = AFTER_PROVIDER_FLOW_BEGIN.with(std::cell::Cell::take) {
+        hook();
+    }
+    show_provider_auth_status(
+        state,
+        editor_container,
+        editor,
+        tui,
+        &format!("Revoking OAuth credentials for {provider_id}…"),
+    );
+    if !provider_flow_still_shown(state, editor_container, editor, tui, flow_id) {
+        return;
+    }
+    let _ = tx.send(TuiMessage::ProviderOAuthAction {
+        provider: provider_id.to_string(),
+        action: "revoke".to_string(),
+        input: serde_json::json!({
+            "credential": {"access": access, "refresh": refresh}
+        }),
+        purpose: ProviderOAuthPurpose::Logout,
         flow_id,
         cancel,
     });
@@ -959,26 +992,29 @@ pub(super) fn handle_provider_oauth_result(
     {
         return;
     }
-    let value = match result {
-        Ok(value) => value,
-        Err(error) => {
-            finish_provider_login(state, editor_container, editor, tui);
-            add_error_message(
-                &state.chat_container,
-                &format!("OAuth {action} failed for {provider}: {error}"),
-            );
-            tui.request_render(false);
-            return;
-        }
-    };
-    let response = match rpi_extensions::OAuthActionResponse::parse(value) {
+    let response = result
+        .map_err(|error| format!("OAuth {action} failed for {provider}: {error}"))
+        .and_then(|value| {
+            rpi_extensions::OAuthActionResponse::parse(value)
+                .map_err(|error| format!("Invalid OAuth response from {provider}: {error}"))
+        });
+    // Every outcome but a login interaction ends the flow. Claim it before
+    // acting, so a result that lost to Esc neither writes the store nor ends a
+    // newer flow; after the claim only the editor is restored, since a flow
+    // begun meanwhile is not this result's to end.
+    let continues_flow = matches!(
+        (purpose, &response),
+        (ProviderOAuthPurpose::Login, Ok(response))
+            if matches!(response.kind, rpi_extensions::OAuthResponseKind::Interaction)
+    );
+    if !continues_flow && !claim_provider_flow(state, flow_id) {
+        return;
+    }
+    let response = match response {
         Ok(response) => response,
-        Err(error) => {
-            finish_provider_login(state, editor_container, editor, tui);
-            add_error_message(
-                &state.chat_container,
-                &format!("Invalid OAuth response from {provider}: {error}"),
-            );
+        Err(message) => {
+            restore_provider_editor(state, editor_container, editor, tui);
+            add_error_message(&state.chat_container, &message);
             tui.request_render(false);
             return;
         }
@@ -999,8 +1035,6 @@ pub(super) fn handle_provider_oauth_result(
         }
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Credential) => {
             match response.credential() {
-                // Esc ended the flow after the check above: drop the credential.
-                Ok(Some(_)) if !claim_provider_flow(state, flow_id) => return,
                 Ok(Some(token)) => match crate::config::upsert_oauth_token(
                     provider,
                     token.access,
@@ -1008,7 +1042,7 @@ pub(super) fn handle_provider_oauth_result(
                     token.expires_at,
                 ) {
                     Ok(()) => {
-                        finish_provider_login(state, editor_container, editor, tui);
+                        restore_provider_editor(state, editor_container, editor, tui);
                         add_note_message(
                             &state.chat_container,
                             &format!(
@@ -1018,7 +1052,7 @@ pub(super) fn handle_provider_oauth_result(
                         let _ = tx.send(TuiMessage::ReloadExtensions);
                     }
                     Err(error) => {
-                        finish_provider_login(state, editor_container, editor, tui);
+                        restore_provider_editor(state, editor_container, editor, tui);
                         add_error_message(
                             &state.chat_container,
                             &format!("Could not save OAuth credentials for {provider}: {error}"),
@@ -1026,7 +1060,7 @@ pub(super) fn handle_provider_oauth_result(
                     }
                 },
                 Ok(None) | Err(_) => {
-                    finish_provider_login(state, editor_container, editor, tui);
+                    restore_provider_editor(state, editor_container, editor, tui);
                     add_error_message(
                         &state.chat_container,
                         &format!("OAuth login for {provider} returned no valid credential."),
@@ -1037,7 +1071,7 @@ pub(super) fn handle_provider_oauth_result(
         }
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Error)
         | (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Success) => {
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
                 &state.chat_container,
                 &format!("OAuth login for {provider} did not return credentials."),
@@ -1045,10 +1079,7 @@ pub(super) fn handle_provider_oauth_result(
             tui.request_render(false);
         }
         (ProviderOAuthPurpose::Logout, rpi_extensions::OAuthResponseKind::Success) => {
-            if !claim_provider_flow(state, flow_id) {
-                return;
-            }
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             match crate::config::delete_credential(provider) {
                 Ok(true) => {
                     add_note_message(
@@ -1069,7 +1100,7 @@ pub(super) fn handle_provider_oauth_result(
             tui.request_render(false);
         }
         (ProviderOAuthPurpose::Logout, _) => {
-            finish_provider_login(state, editor_container, editor, tui);
+            restore_provider_editor(state, editor_container, editor, tui);
             add_error_message(
                 &state.chat_container,
                 &format!(
@@ -1126,12 +1157,6 @@ pub(super) fn begin_provider_oauth_input(
         body,
         "Enter submits · Esc cancels this OAuth flow",
     );
-    *state.active_provider_input.lock().unwrap() = Some(input.clone());
-    editor.set_focused(false);
-    editor_container.clear();
-    editor_container.add_child(frame);
-    tui.set_focus(Some(input.clone()));
-
     let state_submit = state.clone();
     let ec_submit = editor_container.clone();
     let editor_submit = editor.clone();
@@ -1162,7 +1187,7 @@ pub(super) fn begin_provider_oauth_input(
             input: serde_json::json!({"value": value}),
             purpose: ProviderOAuthPurpose::Login,
             flow_id,
-            cancel: state_submit.provider_auth_token(),
+            cancel: state_submit.provider_auth_token(flow_id),
         });
     }));
 
@@ -1175,7 +1200,16 @@ pub(super) fn begin_provider_oauth_input(
             add_note_message(&state_cancel.chat_container, "OAuth login cancelled.");
         }
     }));
-    tui.request_render(false);
+    // Publish the form only once its callbacks exist, so no key reaches it
+    // unhandled.
+    *state.active_provider_input.lock().unwrap() = Some(input.clone());
+    editor.set_focused(false);
+    editor_container.clear();
+    editor_container.add_child(frame);
+    tui.set_focus(Some(input.clone()));
+    if provider_flow_still_shown(state, editor_container, editor, tui, flow_id) {
+        tui.request_render(false);
+    }
 }
 #[cfg(test)]
 thread_local! {
@@ -1185,7 +1219,40 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Claim `flow_id` right before a credential write. Esc's
+#[cfg(test)]
+thread_local! {
+    /// Runs in [`begin_provider_oauth_logout`] right after the flow begins, so
+    /// a test can land an Esc before the status screen shows.
+    pub(super) static AFTER_PROVIDER_FLOW_BEGIN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Call after a flow's screen or form is shown. An Esc handled on the key
+/// worker while it was drawn already ended the flow and restored the editor,
+/// which the drawing then covered: restore it again and report the flow over,
+/// so no screen is left waiting for a result that never comes. A newer flow
+/// that began meanwhile is left running; its own Esc and result still work.
+fn provider_flow_still_shown(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    flow_id: u64,
+) -> bool {
+    match state
+        .provider_auth_flow_id
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        active if active == flow_id => true,
+        0 => {
+            restore_provider_editor(state, editor_container, editor, tui);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Claim `flow_id` before a result ends it. Esc's
 /// [`finish_provider_login`] swaps the same id to zero, so exactly one of a
 /// cancel and a completion wins.
 fn claim_provider_flow(state: &TuiState, flow_id: u64) -> bool {
@@ -1193,16 +1260,7 @@ fn claim_provider_flow(state: &TuiState, flow_id: u64) -> bool {
     if let Some(hook) = BEFORE_PROVIDER_FLOW_CLAIM.with(std::cell::Cell::take) {
         hook();
     }
-    flow_id != 0
-        && state
-            .provider_auth_flow_id
-            .compare_exchange(
-                flow_id,
-                0,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+    state.claim_provider_auth(flow_id)
 }
 
 /// End the provider auth UI and cancel its call. Returns whether this call
@@ -1213,18 +1271,24 @@ pub(super) fn finish_provider_login(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) -> bool {
-    let ended = state
-        .provider_auth_flow_id
-        .swap(0, std::sync::atomic::Ordering::AcqRel)
-        != 0;
-    state.cancel_provider_auth();
+    let ended = state.end_provider_auth();
+    restore_provider_editor(state, editor_container, editor, tui);
+    ended
+}
+
+/// Put the editor back in the input slot, without touching any flow.
+fn restore_provider_editor(
+    state: &TuiState,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+) {
     *state.active_provider_input.lock().unwrap() = None;
     editor_container.clear();
     editor_container.add_child(editor.clone());
     editor.set_focused(true);
     tui.set_focus(Some(editor.clone()));
     tui.request_render(false);
-    ended
 }
 pub(super) fn stored_credential_items() -> Vec<SelectItem> {
     crate::config::read_auth()
