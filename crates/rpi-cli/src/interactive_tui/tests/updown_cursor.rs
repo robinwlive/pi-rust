@@ -181,3 +181,60 @@ fn arrows_over_a_recalled_prompt_keep_its_line_breaks_on_submit() {
         "the submitted prompt must still carry both lines"
     );
 }
+
+/// Continuing a browse session with the keyboard after recalling a SINGLE-LINE
+/// entry: ↓ must walk to the older entry and ↑ must come back — the routing
+/// predicate, not just `navigate_history`, has to honour the browse state
+/// (`history_index != -1`).
+#[test]
+fn single_line_recall_continues_browsing_with_both_arrows() {
+    let state = test_tui_state();
+    let editor = state.editor.clone();
+    push_history(&state, "older prompt");
+    push_history(&state, "newest prompt");
+
+    // Fresh prompt: ↑ recalls the newest entry.
+    assert!(arrow_belongs_to_history(&state, &editor, -1));
+    navigate_history(&state, &editor, -1);
+    assert_eq!(editor.get_text(), "newest prompt");
+    assert_eq!(*state.history_index.lock().unwrap(), 0);
+
+    // Mid-session on a single-line entry: both arrows stay with history.
+    assert!(
+        arrow_belongs_to_history(&state, &editor, -1),
+        "↑ during an active browse session must step history, not the caret"
+    );
+    navigate_history(&state, &editor, -1);
+    assert_eq!(editor.get_text(), "older prompt");
+
+    assert!(
+        arrow_belongs_to_history(&state, &editor, 1),
+        "↓ during an active browse session must stay in history"
+    );
+    navigate_history(&state, &editor, 1);
+    assert_eq!(editor.get_text(), "newest prompt");
+
+    // ↓ past the newest entry ends the session and restores the draft.
+    assert!(arrow_belongs_to_history(&state, &editor, 1));
+    navigate_history(&state, &editor, 1);
+    assert_eq!(editor.get_text(), "");
+    assert_eq!(*state.history_index.lock().unwrap(), -1);
+}
+
+/// A TYPED single-line draft must still never swap itself for a history entry,
+/// even though the same "one line, non-empty" shape now has to route to
+/// history once a browse session is active — the two cases differ only in
+/// `history_index`.
+#[test]
+fn typed_single_line_draft_is_still_never_replaced() {
+    let state = test_tui_state();
+    let editor = state.editor.clone();
+    push_history(&state, "some prompt");
+    editor.set_text("my draft");
+    editor.set_cursor(0, 4);
+
+    assert!(!arrow_belongs_to_history(&state, &editor, -1));
+    assert!(!arrow_belongs_to_history(&state, &editor, 1));
+    assert_eq!(*state.history_index.lock().unwrap(), -1);
+    assert_eq!(editor.get_text(), "my draft");
+}

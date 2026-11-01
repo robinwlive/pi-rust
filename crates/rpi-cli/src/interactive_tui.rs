@@ -2765,7 +2765,8 @@ pub async fn interactive_tui(
             //     immediately. A single-line draft keeps the older contract
             //     and never swaps itself for a history entry: that was
             //     reported as "text disappeared", and one line has no second
-            //     row to move to.
+            //     row to move to — but once a browse session is active, ↑/↓
+            //     keep walking history (a one-line recall must not strand it).
             if key.modifiers == KeyModifiers::NONE
                 && matches!(key.code, KeyCode::Up | KeyCode::Down)
             {

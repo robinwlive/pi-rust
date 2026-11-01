@@ -1401,6 +1401,9 @@ pub(super) fn poll_auto_send(
 /// replace it. That behaviour is deliberate — swapping a typed draft for a
 /// history entry was reported as "text disappeared" — and a single-line prompt
 /// has no second row to move to, so there is no "again" press to reinterpret.
+/// An active browse session is the exception: after recalling a single-line
+/// entry the editor is exactly that shape, and ↑/↓ must keep walking history
+/// until ↓ past the newest entry ends the session.
 ///
 /// `direction` is -1 (↑, older) or 1 (↓, newer), matching [`navigate_history`].
 pub(super) fn arrow_belongs_to_history(
@@ -1417,7 +1420,7 @@ pub(super) fn arrow_belongs_to_history(
         return true;
     }
     if editor.line_count() < 2 {
-        return false;
+        return *state.history_index.lock().unwrap() != -1;
     }
     let (row, _col) = editor.cursor_position();
     if direction < 0 {
