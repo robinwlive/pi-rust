@@ -1113,9 +1113,10 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         let _ = fs::remove_file(marker);
     }
 
-    /// Reload while a cancellable call is in flight: the old library stays
-    /// mapped until the call returns, cancellation still reaches it, and the
-    /// reloaded plugin serves new calls on its own.
+    /// Reload while a cancellable call is in flight: the call keeps the old
+    /// session's keepalive until it returns, cancellation still reaches it, and
+    /// the reloaded snapshot dispatches a new call to a live plugin. (The OS may
+    /// share one mapping for the same path; the keepalive count is what is pinned.)
     #[test]
     fn cancellable_oauth_call_survives_a_reload_and_still_cancels() {
         let marker = std::env::temp_dir().join(format!("rpi-oauth-reload-{}", std::process::id()));
@@ -1131,6 +1132,7 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         };
         let old = load();
         let (snapshot, keepalive) = (old.snapshot_arc().unwrap(), old.keepalive());
+        let old_keepalive = Arc::downgrade(&keepalive);
         let cancel = tokio_util::sync::CancellationToken::new();
         let worker_cancel = cancel.clone();
         // Holds the keepalive across the call, as the TUI's blocking task does.
@@ -1152,6 +1154,10 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         old.begin_shutdown();
         drop(old);
         let reloaded = load();
+        assert!(
+            old_keepalive.strong_count() > 0,
+            "the reload released the old session under the in-flight call"
+        );
         cancel.cancel();
         let result = worker.join().unwrap();
         assert!(
@@ -1159,6 +1165,33 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
             "{result:?}"
         );
         assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        assert_eq!(
+            old_keepalive.strong_count(),
+            0,
+            "the old keepalive outlived the cancelled call"
+        );
+
+        // The reloaded snapshot serves a new call, which a cancel still stops.
+        let new_snapshot = reloaded.snapshot_arc().expect("reloaded plugin registers");
+        let new_cancel = tokio_util::sync::CancellationToken::new();
+        let new_worker_cancel = new_cancel.clone();
+        let new_worker = std::thread::spawn(move || {
+            crate::request_oauth_with_cancel(
+                &new_snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &new_worker_cancel,
+            )
+        });
+        wait_for_marker(&marker, b"CKC");
+        new_cancel.cancel();
+        let result = new_worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"CKCK");
 
         let precancelled = tokio_util::sync::CancellationToken::new();
         precancelled.cancel();
@@ -1175,7 +1208,7 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
         );
         assert_eq!(
             fs::read(&marker).unwrap(),
-            b"CK",
+            b"CKCK",
             "a cancelled call reached the reloaded plugin"
         );
         let _ = fs::remove_file(marker);
