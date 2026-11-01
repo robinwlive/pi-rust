@@ -2,6 +2,8 @@ use super::*;
 use rpi_tui::Component;
 
 mod autocomplete_flicker;
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
+mod clipboard_persistence;
 mod enter_completion;
 mod session_regressions;
 
