@@ -1338,7 +1338,6 @@ pub async fn interactive_tui(
                 if event.active {
                     if state.show_terminal_progress {
                         state.editor.set_working(Some(WorkingState {
-                            frame: 0,
                             started_at: std::time::Instant::now(),
                             message: if event.manual {
                                 "Compacting context… (Esc to cancel)"
@@ -1656,10 +1655,13 @@ pub async fn interactive_tui(
         }
     });
 
-    // ---- Render-tick task (advances the loader spinner while Working) ----
+    // ---- Render-tick task (keeps the spinner animating while Working) ----
     //
-    // The `Loader` only advances its frame on render; without a periodic
-    // `request_render` the spinner visibly freezes between events.
+    // The spinner frame is derived from wall-clock time at render time (one
+    // step per `SPINNER_FRAME_MS`, matching upstream's `setInterval` cadence),
+    // but a frame only reaches the screen when something repaints. Without a
+    // periodic `request_render` a quiet stretch (thinking, tool running) would
+    // show a frozen glyph even though the frame index moved.
     let tui_tick = tui.clone();
     let state_tick = state.clone();
     // The tick, not the key loop, drives the voice-draft auto-send: it must
@@ -1681,12 +1683,9 @@ pub async fn interactive_tui(
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
-        // frame is advanced by `Editor::render` (mirroring `Loader::render`),
-        // so streaming output — which schedules a frame per token — spins it
-        // faster, and this interval is the floor when the model is silent.
-        //
-        // Advancing here as well would double-step every tick and make the idle
-        // spinner run at 40ms/frame, twice upstream's rate.
+        // frame itself comes from elapsed wall-clock time inside the render, so
+        // this interval is only the repaint floor for quiet stretches and has
+        // no effect on the visible speed (streaming repaints included).
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
             rpi_tui::loader::SPINNER_FRAME_MS,
         ));

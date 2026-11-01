@@ -1657,7 +1657,6 @@ impl TuiState {
                 // `show_terminal_progress` disables it entirely.
                 if self.show_terminal_progress {
                     self.editor.set_working(Some(WorkingState {
-                        frame: 0,
                         started_at: std::time::Instant::now(),
                         message: "Working…".to_string(),
                     }));
