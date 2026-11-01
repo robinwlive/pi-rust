@@ -999,6 +999,8 @@ pub(super) fn handle_provider_oauth_result(
         }
         (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Credential) => {
             match response.credential() {
+                // Esc ended the flow after the check above: drop the credential.
+                Ok(Some(_)) if !claim_provider_flow(state, flow_id) => return,
                 Ok(Some(token)) => match crate::config::upsert_oauth_token(
                     provider,
                     token.access,
@@ -1043,6 +1045,9 @@ pub(super) fn handle_provider_oauth_result(
             tui.request_render(false);
         }
         (ProviderOAuthPurpose::Logout, rpi_extensions::OAuthResponseKind::Success) => {
+            if !claim_provider_flow(state, flow_id) {
+                return;
+            }
             finish_provider_login(state, editor_container, editor, tui);
             match crate::config::delete_credential(provider) {
                 Ok(true) => {
@@ -1166,20 +1171,52 @@ pub(super) fn begin_provider_oauth_input(
     let editor_cancel = editor.clone();
     let tui_cancel = tui.clone();
     input.on_escape(Arc::new(move || {
-        finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-        add_note_message(&state_cancel.chat_container, "OAuth login cancelled.");
+        if finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel) {
+            add_note_message(&state_cancel.chat_container, "OAuth login cancelled.");
+        }
     }));
     tui.request_render(false);
 }
+#[cfg(test)]
+thread_local! {
+    /// Runs inside [`claim_provider_flow`] before the claim, so a test can
+    /// land an Esc between a result's flow check and its credential write.
+    pub(super) static BEFORE_PROVIDER_FLOW_CLAIM: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Claim `flow_id` right before a credential write. Esc's
+/// [`finish_provider_login`] swaps the same id to zero, so exactly one of a
+/// cancel and a completion wins.
+fn claim_provider_flow(state: &TuiState, flow_id: u64) -> bool {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_PROVIDER_FLOW_CLAIM.with(std::cell::Cell::take) {
+        hook();
+    }
+    flow_id != 0
+        && state
+            .provider_auth_flow_id
+            .compare_exchange(
+                flow_id,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+}
+
+/// End the provider auth UI and cancel its call. Returns whether this call
+/// ended an active OAuth flow, i.e. won it against a completing result.
 pub(super) fn finish_provider_login(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-) {
-    state
+) -> bool {
+    let ended = state
         .provider_auth_flow_id
-        .store(0, std::sync::atomic::Ordering::Release);
+        .swap(0, std::sync::atomic::Ordering::AcqRel)
+        != 0;
     state.cancel_provider_auth();
     *state.active_provider_input.lock().unwrap() = None;
     editor_container.clear();
@@ -1187,6 +1224,7 @@ pub(super) fn finish_provider_login(
     editor.set_focused(true);
     tui.set_focus(Some(editor.clone()));
     tui.request_render(false);
+    ended
 }
 pub(super) fn stored_credential_items() -> Vec<SelectItem> {
     crate::config::read_auth()

@@ -2193,13 +2193,16 @@ pub async fn interactive_tui(
                 .load(std::sync::atomic::Ordering::Acquire)
                 != 0
             {
-                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-                    finish_provider_login(
+                // Only report a cancel that won the flow from a completing result.
+                if key.code == KeyCode::Esc
+                    && key.modifiers == KeyModifiers::NONE
+                    && finish_provider_login(
                         &state_for_key,
                         &ctx_for_key.editor_container,
                         &editor_for_key,
                         &tui_for_key,
-                    );
+                    )
+                {
                     add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();

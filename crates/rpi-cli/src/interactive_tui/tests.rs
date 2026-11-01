@@ -2453,6 +2453,102 @@ fn provider_oauth_escape_cancels_the_in_flight_call() {
     assert!(state.provider_auth_token().is_cancelled());
 }
 
+/// Esc that lands after a result passed its flow check, but before the write,
+/// wins the flow: neither the login credential nor the logout delete touches
+/// the store. A completion that claims first leaves Esc nothing to cancel.
+#[test]
+fn escape_between_the_flow_check_and_the_write_keeps_the_store_unchanged() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let escape_won = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arm_escape = || {
+            let (state, editor_container, editor, tui, escape_won) = (
+                state.clone(),
+                editor_container.clone(),
+                editor.clone(),
+                tui.clone(),
+                escape_won.clone(),
+            );
+            settings::BEFORE_PROVIDER_FLOW_CLAIM.with(|hook| {
+                hook.set(Some(Box::new(move || {
+                    let won = finish_provider_login(&state, &editor_container, &editor, &tui);
+                    escape_won.store(won, std::sync::atomic::Ordering::SeqCst);
+                })))
+            });
+        };
+        let credential = || {
+            Ok(serde_json::json!({
+                "version": 1,
+                "kind": "credential",
+                "payload": {"access": "late-access", "refresh": "late-refresh", "expires_at": 0}
+            }))
+        };
+        let result = |flow_id, purpose, value| {
+            handle_provider_oauth_result(
+                &state,
+                &editor_container,
+                &editor,
+                &tui,
+                &tx,
+                "acme",
+                "exchange",
+                value,
+                purpose,
+                flow_id,
+            )
+        };
+        let begin = |rx: &mut mpsc::UnboundedReceiver<TuiMessage>| {
+            begin_provider_oauth_login(&state, &editor_container, &editor, &tui, &tx, "acme");
+            let Ok(TuiMessage::ProviderOAuthAction { flow_id, .. }) = rx.try_recv() else {
+                panic!("begin was not sent");
+            };
+            flow_id
+        };
+
+        // Login: Esc lands between the check and the write.
+        let flow_id = begin(&mut rx);
+        arm_escape();
+        result(flow_id, ProviderOAuthPurpose::Login, credential());
+        assert!(escape_won.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_none());
+        assert!(rx.try_recv().is_err(), "a cancelled login must not reload");
+
+        // Logout: the revoke succeeded, but Esc won, so the credential stays.
+        crate::config::upsert_oauth_token("acme", "kept".into(), "kept".into(), 0).unwrap();
+        let flow_id = begin(&mut rx);
+        arm_escape();
+        result(
+            flow_id,
+            ProviderOAuthPurpose::Logout,
+            Ok(serde_json::json!({"version": 1, "kind": "success", "payload": {}})),
+        );
+        assert!(escape_won.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(rx.try_recv().is_err());
+
+        // The completion claims first: it saves, and a later Esc ends nothing.
+        crate::config::delete_credential("acme").unwrap();
+        let flow_id = begin(&mut rx);
+        result(flow_id, ProviderOAuthPurpose::Login, credential());
+        assert!(crate::config::read_oauth_token("acme").unwrap().is_some());
+        assert!(!finish_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui
+        ));
+    });
+}
+
 #[test]
 fn provider_form_saves_provider_to_models_json() {
     with_isolated_config_dir(|| {
