@@ -243,6 +243,10 @@ pub(super) struct TuiState {
     /// Monotonic source for OAuth flow ids. Kept separate so an inactive flow
     /// can use zero without allowing a late result to match a future flow.
     pub(super) provider_auth_generation: std::sync::atomic::AtomicU64,
+    /// Cancellation for the provider OAuth call in flight. Created when a flow
+    /// begins and cancelled when it ends (Esc, a finished result, or a new flow),
+    /// so a plugin's blocking begin, exchange or revoke can stop early.
+    pub(super) provider_auth_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// The select-list currently occupying the input slot for a choice-style
     /// provider form step (the protocol step). Mutually exclusive with
     /// [`Self::active_provider_input`].
@@ -1462,6 +1466,85 @@ impl TuiState {
             previous.cancel();
         }
         cancellation
+    }
+
+    /// Start a provider OAuth flow: allocate its id and publish the id and its
+    /// cancellation token in one step under the token lock, so an Esc that ends
+    /// the flow always finds the token to cancel. A previous flow's token is
+    /// cancelled, so a call from an older flow cannot outlive it.
+    pub(super) fn begin_provider_auth(&self) -> (u64, CancellationToken) {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let flow_id = self
+            .provider_auth_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = slot.replace(cancellation.clone()) {
+            previous.cancel();
+        }
+        self.provider_auth_flow_id
+            .store(flow_id, std::sync::atomic::Ordering::Release);
+        (flow_id, cancellation)
+    }
+
+    /// The token for flow `flow_id`'s next provider call. If that flow is no
+    /// longer active it is already cancelled, so a late submit cannot run
+    /// unobserved or borrow a newer flow's token.
+    pub(super) fn provider_auth_token(&self, flow_id: u64) -> CancellationToken {
+        let slot = self.provider_auth_cancel.lock().unwrap();
+        match slot.as_ref() {
+            Some(cancellation)
+                if self
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == flow_id =>
+            {
+                cancellation.clone()
+            }
+            _ => {
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                cancellation
+            }
+        }
+    }
+
+    /// End the active provider OAuth flow, if any, and cancel its call. Returns
+    /// whether a flow was active, i.e. this end won it from a completing result.
+    pub(super) fn end_provider_auth(&self) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let ended = self
+            .provider_auth_flow_id
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+            != 0;
+        if let Some(cancellation) = slot.take() {
+            cancellation.cancel();
+        }
+        ended
+    }
+
+    /// End flow `flow_id` only if it is still the active one, for a result
+    /// about to write the store. Exactly one of this and an Esc's
+    /// [`Self::end_provider_auth`] wins; a losing claim changes nothing.
+    pub(super) fn claim_provider_auth(&self, flow_id: u64) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let claimed = flow_id != 0
+            && self
+                .provider_auth_flow_id
+                .compare_exchange(
+                    flow_id,
+                    0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+        if claimed {
+            // The call already returned; this only clears the slot.
+            if let Some(cancellation) = slot.take() {
+                cancellation.cancel();
+            }
+        }
+        claimed
     }
 
     /// Clear the user-bash slot. Called when the command finishes so the
