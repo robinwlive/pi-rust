@@ -727,6 +727,8 @@ enum TuiMessage {
         input: serde_json::Value,
         purpose: ProviderOAuthPurpose,
         flow_id: u64,
+        /// Cancelled when the flow ends; the plugin call observes it.
+        cancel: CancellationToken,
     },
     /// Result of one provider-owned OAuth action.
     ProviderOAuthResult {
@@ -1288,6 +1290,7 @@ pub async fn interactive_tui(
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2190,13 +2193,16 @@ pub async fn interactive_tui(
                 .load(std::sync::atomic::Ordering::Acquire)
                 != 0
             {
-                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-                    finish_provider_login(
+                // Only report a cancel that won the flow from a completing result.
+                if key.code == KeyCode::Esc
+                    && key.modifiers == KeyModifiers::NONE
+                    && finish_provider_login(
                         &state_for_key,
                         &ctx_for_key.editor_container,
                         &editor_for_key,
                         &tui_for_key,
-                    );
+                    )
+                {
                     add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
@@ -3423,7 +3429,16 @@ pub async fn interactive_tui(
                 input,
                 purpose,
                 flow_id,
+                cancel,
             }) => {
+                // The flow ended (Esc, or a newer flow) before its call started.
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
                 let (snapshot, keepalive) = {
                     let session = ctx
                         .reload_context
@@ -3442,11 +3457,12 @@ pub async fn interactive_tui(
                             let action_call = action.clone();
                             tokio::task::spawn_blocking(move || {
                                 let _keepalive = keepalive;
-                                rpi_extensions::request_oauth(
+                                rpi_extensions::request_oauth_with_cancel(
                                     &snapshot,
                                     &provider_call,
                                     &action_call,
                                     input,
+                                    &cancel,
                                 )
                                 .map_err(|error| error.to_string())
                             })
@@ -3472,13 +3488,6 @@ pub async fn interactive_tui(
                 purpose,
                 flow_id,
             }) => {
-                if state
-                    .provider_auth_flow_id
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != flow_id
-                {
-                    continue;
-                }
                 handle_provider_oauth_result(
                     &state,
                     &editor_container,
@@ -3509,29 +3518,16 @@ pub async fn interactive_tui(
                     Some(crate::config::Credential::Oauth {
                         access, refresh, ..
                     }) => {
-                        show_provider_auth_status(
+                        begin_provider_oauth_logout(
                             &state,
                             &editor_container,
                             &editor,
                             &tui,
-                            &format!("Revoking OAuth credentials for {provider}…"),
+                            &ctx.tx,
+                            &provider,
+                            access,
+                            refresh,
                         );
-                        let flow_id = state
-                            .provider_auth_generation
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                            .wrapping_add(1);
-                        state
-                            .provider_auth_flow_id
-                            .store(flow_id, std::sync::atomic::Ordering::Release);
-                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
-                            provider,
-                            action: "revoke".to_string(),
-                            input: serde_json::json!({
-                                "credential": {"access": access, "refresh": refresh}
-                            }),
-                            purpose: ProviderOAuthPurpose::Logout,
-                            flow_id,
-                        });
                     }
                     Some(crate::config::Credential::ApiKey { .. }) => {
                         match crate::config::delete_credential(&provider) {
