@@ -2756,26 +2756,22 @@ pub async fn interactive_tui(
                 }
             }
 
-            // 5b. ↑/↓ browse submitted-message history when the editor is
-            //     EMPTY (a fresh prompt) — mirrors TS historyPrevious/Next
-            //     without the surprise of replacing typed text. When the
-            //     editor holds content, ↑/↓ fall through to cursor movement
-            //     (typing "hello", pressing ↑ at the start, must never swap
-            //     the draft for a history entry — reported as "text
-            //     disappeared"). Once browsing, ↓ walks back and restores the
-            //     draft.
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, -1);
-                    tui_for_key.request_render_reusing_scroll_content();
-                    continue;
-                }
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, 1);
+            // 5b. ↑/↓ move the caret through a multi-line draft, and only
+            //     leave for prompt history once the caret cannot move any
+            //     further (first line for ↑, last line for ↓) — mirrors TS
+            //     historyPrevious/Next, which only fire at the editor's edge.
+            //     A fresh prompt (no caret row to move to) recalls
+            //     immediately. A single-line draft keeps the older contract
+            //     and never swaps itself for a history entry: that was
+            //     reported as "text disappeared", and one line has no second
+            //     row to move to — but once a browse session is active, ↑/↓
+            //     keep walking history (a one-line recall must not strand it).
+            if key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+                if arrow_belongs_to_history(&state_for_key, &editor_for_key, direction) {
+                    navigate_history(&state_for_key, &editor_for_key, direction);
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
