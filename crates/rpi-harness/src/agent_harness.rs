@@ -2549,6 +2549,17 @@ impl AgentHarness {
         let run_id = self.session.id_generator().next();
         let signal = CancellationToken::new();
         let idle = Arc::new(tokio::sync::Notify::new());
+        // Clear a request left over from an *idle* call: `StopRound` on an idle
+        // lane is a no-op, and the flag would otherwise be consumed by this
+        // run's first turn boundary — the prompt would stop after one turn as
+        // if the user had asked it to.
+        //
+        // This must happen *before* `active_run` is published: `RunStart` is
+        // emitted later, and a synchronous listener may legitimately request
+        // `StopRound` for the run it is being told about. Clearing afterwards
+        // would erase that request.
+        self.stop_round
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         inner.active_run = Some(ActiveRun {
             finishing: false,
             run_id: run_id.clone(),
@@ -4356,13 +4367,6 @@ impl AgentHarness {
         // turn budget and the user's `StopRound` request share it. Either one
         // being true ends the run at the turn boundary.
         //
-        // Clear any request left over from an *idle* call: the documented
-        // contract is that `StopRound` on an idle lane is a no-op, and without
-        // this the flag would be consumed by the next run's first turn
-        // boundary — i.e. the next prompt would stop after one turn as if the
-        // user had asked it to.
-        self.stop_round
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         let stop_round_flag = Arc::clone(&self.stop_round);
         let budget_enabled = run_budget.lock().unwrap().is_enabled();
         let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> = if budget_enabled {
@@ -4682,6 +4686,18 @@ impl AgentHarness {
                 // A from-assistant attempt already ran the polled message's tools,
                 // so retrying would run them a second time. One attempt only.
                 || from_assistant
+            {
+                break attempt_result;
+            }
+
+            // This attempt would be retried, i.e. the loop is about to cross a
+            // turn boundary. A one-shot `StopRound` request applies here just as
+            // it does on the success path: a provider call that ended with a
+            // retryable error has still finished its turn. Consumed only on this
+            // path, so a request meant for the next turn boundary is not erased.
+            if self
+                .stop_round
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 break attempt_result;
             }
@@ -6541,6 +6557,48 @@ mod session_switch_tests {
         assert_eq!(
             HarnessError::session_storage("disk full").tag().as_str(),
             "SessionStorage"
+        );
+    }
+
+    /// A `StopRound` requested from a synchronous `RunStart` listener belongs to
+    /// the run being announced and must survive startup.
+    ///
+    /// Regression: the idle-leftover reset used to run after `RunStart` was
+    /// emitted, so it erased exactly this request and the run continued to a
+    /// second provider call instead of stopping at the first turn boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_round_requested_at_run_start_is_honored() {
+        use rpi_ai::providers::faux::{FauxScript, FauxStep};
+
+        let mut script =
+            FauxScript::new().with_tool_call("bash", serde_json::json!({"command":"true"}));
+        script.append_responses(vec![FauxStep::text("second turn")]);
+        let provider = rpi_ai::providers::faux::FauxProvider::new(script);
+        let harness = AgentHarness::create(AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider.clone()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let requester = harness.clone();
+        let _subscription = harness.bus.on::<RunStartEvent, _>(move |_| {
+            requester.request_stop_round();
+        });
+
+        harness
+            .prompt_text("one", vec![])
+            .await
+            .expect("the prompt settles");
+        // Turn one finished and the request stopped the loop: no second call.
+        assert_eq!(
+            provider
+                .state()
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a StopRound requested at RunStart must stop after the first turn"
         );
     }
 
