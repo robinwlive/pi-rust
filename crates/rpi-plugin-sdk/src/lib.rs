@@ -694,13 +694,28 @@ pub enum EventTag {
     /// is deliberately not shipped, because subscribers (a voice extension
     /// barging in on playback) only need to know *that* the user is composing.
     EditorChange = 36,
+
+    /// Turn-end **payload** event, separate from the [`EventTag::TurnEnd`]
+    /// lifecycle tag.
+    ///
+    /// `TurnEnd` may be sent by a host built against a pre-payload SDK, which
+    /// writes it with [`StablePluginEvent::empty`] — a 1-byte write into a
+    /// union whose `data` arm is a 16-byte `StbString`. Reading `payload.data`
+    /// for such a host would read uninitialized memory, and the ABI handshake
+    /// cannot distinguish the two hosts. Carrying the payload under its own tag
+    /// removes the ambiguity: a host that does not support it never sends this
+    /// tag, so the read is only reachable on hosts that do.
+    ///
+    /// Appended last so every existing discriminant stays stable.
+    TurnEndPayload = 37,
 }
 
-/// Number of event categories — `37` (33 Pi `on()` categories + 1 rpi-specific
-/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 1 rpi-specific
-/// [`EventTag::EditorChange`]). A test asserts
-/// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 37;
+/// Number of event categories — `38` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 2 rpi-specific payload
+/// tags: [`EventTag::EditorChange`] and [`EventTag::TurnEndPayload`]). A test
+/// asserts `EVENT_TAG_COUNT == 38` so a future edit that adds/removes a tag is
+/// caught.
+pub const EVENT_TAG_COUNT: usize = 38;
 
 /// The application name of the host that loads plugins: `"rpi"`.
 ///
@@ -2054,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_37() {
+    fn event_tag_count_is_38() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
         // 37-category surface is intact (33 Pi on() categories + the
         // rpi-specific BeforeTuiStart + 2 UI prompt events + EditorChange).
@@ -2096,13 +2111,14 @@ mod tests {
             EventTag::UiPromptStart,
             EventTag::UiPromptEnd,
             EventTag::EditorChange,
+            EventTag::TurnEndPayload,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 37);
-        // Distinct discriminants 0..36.
+        assert_eq!(EVENT_TAG_COUNT, 38);
+        // Distinct discriminants 0..=36.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..37).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..38).collect::<Vec<u32>>());
     }
 
     #[test]
